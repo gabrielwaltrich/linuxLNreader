@@ -1,0 +1,36 @@
+[project]
+name = "novel-reader"
+version = "0.3.1"
+description = "Leitor minimalista de novels para Linux"
+requires-python = ">=3.10"
+dependencies = [
+    "PySide6>=6.9",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pyside6-project]
+files = [
+    "main.py",
+    "novel_reader/__init__.py",
+    "novel_reader/app.py",
+    "novel_reader/errors.py",
+    "novel_reader/models.py",
+    "novel_reader/styles.py",
+    "novel_reader/browser/__init__.py",
+    "novel_reader/browser/session.py",
+    "novel_reader/services/__init__.py",
+    "novel_reader/services/downloader.py",
+    "novel_reader/sources/__init__.py",
+    "novel_reader/sources/base.py",
+    "novel_reader/sources/generic.py",
+    "novel_reader/sources/manager.py",
+    "novel_reader/sources/webnovel.py",
+    "novel_reader/ui/__init__.py",
+    "novel_reader/ui/main_window.py",
+    "novel_reader/ui/reader_view.py",
+    "novel_reader/ui/source_worker.py",
+]
