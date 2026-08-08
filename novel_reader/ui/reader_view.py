@@ -20,6 +20,8 @@ class ReaderView(QTextBrowser):
 
         self.setOpenExternalLinks(False)
         self.setReadOnly(True)
+        self.setObjectName("readerSurface")
+        self.setFrameShape(self.Shape.NoFrame)
 
         scrollbar = self.verticalScrollBar()
         scrollbar.valueChanged.connect(self._emit_progress)
@@ -74,9 +76,15 @@ class ReaderView(QTextBrowser):
         if not self._text:
             self.setHtml(
                 f"""
-                <div style="max-width: {self._content_width}px; margin: 90px auto; text-align:center;">
-                    <h2>Nenhum capítulo aberto</h2>
-                    <p>Use “Abrir TXT” ou “Carregar demonstração”.</p>
+                <div style="max-width:{self._content_width}px; margin:120px auto; text-align:center;">
+                    <div style="font-size:46px; margin-bottom:18px;">📖</div>
+                    <div style="font-size:24px; font-weight:700; margin-bottom:10px;">
+                        Sua leitura começa aqui
+                    </div>
+                    <div style="font-size:14px; opacity:.62; line-height:1.6;">
+                        Cole a URL de uma obra ou capítulo no topo,<br>
+                        escolha algo na Library ou abra um arquivo TXT.
+                    </div>
                 </div>
                 """
             )
@@ -87,21 +95,48 @@ class ReaderView(QTextBrowser):
             paragraph = paragraph.strip()
             if paragraph:
                 paragraphs.append(
-                    f'<p style="line-height:{self._line_height}; margin:0 0 1.15em 0;">'
+                    f'<p style="line-height:{self._line_height}; margin:0 0 1.28em 0;">'
                     f'{escape(paragraph).replace(chr(10), "<br>")}</p>'
                 )
 
         body = "\n".join(paragraphs)
+        safe_title = escape(self._title)
+        safe_chapter = escape(self._chapter)
 
         self.setHtml(
             f"""
-            <div style="max-width: {self._content_width}px; margin: 55px auto 120px auto;">
-                <div style="text-align:center; margin-bottom:50px;">
-                    <div style="font-size:0.70em; opacity:0.65;">{escape(self._title)}</div>
-                    <h2 style="font-weight:600; margin-top:10px;">{escape(self._chapter)}</h2>
-                </div>
-                {body}
-            </div>
+            <article style="
+                max-width:{self._content_width}px;
+                margin:64px auto 150px auto;
+                padding:0 34px;
+            ">
+                <header style="
+                    text-align:left;
+                    margin-bottom:52px;
+                    padding-bottom:30px;
+                    border-bottom:1px solid rgba(127,127,127,.20);
+                ">
+                    <div style="
+                        font-size:12px;
+                        text-transform:uppercase;
+                        letter-spacing:1.3px;
+                        opacity:.58;
+                        font-weight:600;
+                        margin-bottom:12px;
+                    ">{safe_title}</div>
+                    <div style="
+                        font-size:1.55em;
+                        font-weight:750;
+                        line-height:1.25;
+                    ">{safe_chapter}</div>
+                </header>
+                <section style="
+                    font-size:1em;
+                    letter-spacing:.05px;
+                ">
+                    {body}
+                </section>
+            </article>
             """
         )
 

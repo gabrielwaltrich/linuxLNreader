@@ -2,6 +2,25 @@
 
 Todas as mudanças importantes do Novel Reader são registradas aqui.
 
+
+## [1.0.1] - 2026-08-08
+
+Atualização focada na experiência visual da interface gráfica.
+
+### GUI
+- Novo sistema visual claro e escuro.
+- Cabeçalho de aplicação com ações principais.
+- Campo de URL reorganizado em card próprio.
+- Área de leitura com superfície, espaçamento e tipografia mais refinados.
+- Estado vazio do Reader redesenhado.
+- Barra de leitura inferior compacta e consistente.
+- Botões primários, secundários, acento e perigo padronizados.
+- Library redesenhada com card de detalhes, busca e árvore mais legíveis.
+- Preferências redesenhadas.
+- Scrollbars, campos, combos, tooltips e status bar atualizados.
+- Título e textos antigos de versões de desenvolvimento removidos.
+
+
 ## [1.0.0] - 2026-08-08
 
 Primeira versão estável do Novel Reader para Linux.

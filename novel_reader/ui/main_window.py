@@ -6,6 +6,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -70,8 +71,8 @@ class MainWindow(QMainWindow):
         self.progress_timer.setInterval(650)
         self.progress_timer.timeout.connect(self._save_current_progress)
 
-        self.setWindowTitle("Novel Reader — v0.5.1 — Passo 7")
-        self.resize(1180, 780)
+        self.setWindowTitle("Novel Reader 1.0.1")
+        self.resize(1320, 860)
 
         self._build_ui()
         self._build_library()
@@ -83,80 +84,133 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         root = QWidget()
+        root.setObjectName("appRoot")
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(24, 18, 24, 8)
+        layout.setContentsMargins(22, 18, 22, 10)
         layout.setSpacing(12)
 
-        top = QHBoxLayout()
+        # Brand/header
+        header = QFrame()
+        header.setObjectName("topHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(18, 12, 14, 12)
+        header_layout.setSpacing(10)
+
+        brand_col = QVBoxLayout()
+        brand_col.setSpacing(1)
+        brand = QLabel("Novel Reader")
+        brand.setObjectName("brandTitle")
+        subtitle = QLabel("Sua Library e leitura em um só lugar")
+        subtitle.setObjectName("brandSubtitle")
+        brand_col.addWidget(brand)
+        brand_col.addWidget(subtitle)
+        header_layout.addLayout(brand_col)
+        header_layout.addStretch(1)
+
+        self.continue_button = QPushButton("▶ Continuar")
+        self.continue_button.setObjectName("primaryButton")
+        self.continue_button.clicked.connect(self.continue_last)
+
+        self.library_button = QPushButton("Library")
+        self.library_button.setObjectName("accentButton")
+        self.library_button.clicked.connect(self.toggle_library)
+
+        self.preferences_button = QPushButton("⚙ Preferências")
+        self.preferences_button.clicked.connect(self.open_preferences)
+
+        self.theme_button = QPushButton("☾")
+        self.theme_button.setObjectName("iconButton")
+        self.theme_button.setToolTip("Alternar tema")
+        self.theme_button.clicked.connect(self.toggle_theme)
+
+        header_layout.addWidget(self.continue_button)
+        header_layout.addWidget(self.library_button)
+        header_layout.addWidget(self.preferences_button)
+        header_layout.addWidget(self.theme_button)
+        layout.addWidget(header)
+
+        # URL/open card
+        url_card = QFrame()
+        url_card.setObjectName("urlCard")
+        top = QHBoxLayout(url_card)
+        top.setContentsMargins(14, 11, 14, 11)
         top.setSpacing(8)
 
         self.url_input = QLineEdit()
-        self.url_input.setPlaceholderText("Cole uma URL de livro ou capítulo...")
+        self.url_input.setPlaceholderText(
+            "Cole uma URL de livro ou capítulo do WebNovel…"
+        )
+        self.url_input.setClearButtonEnabled(True)
         self.url_input.returnPressed.connect(self.open_url)
 
         self.open_url_button = QPushButton("Abrir")
+        self.open_url_button.setObjectName("primaryButton")
         self.open_url_button.clicked.connect(self.open_url)
 
-        self.continue_button = QPushButton("Continuar")
-        self.continue_button.clicked.connect(self.continue_last)
-
-        self.library_button = QPushButton("Biblioteca")
-        self.library_button.clicked.connect(self.toggle_library)
-
         self.open_txt_button = QPushButton("Abrir TXT")
-        self.preferences_button = QPushButton("Preferências")
-        self.preferences_button.clicked.connect(self.open_preferences)
         self.open_txt_button.clicked.connect(self.open_txt)
 
         top.addWidget(self.url_input, 1)
         top.addWidget(self.open_url_button)
-        top.addWidget(self.continue_button)
-        top.addWidget(self.library_button)
         top.addWidget(self.open_txt_button)
-        top.addWidget(self.preferences_button)
+        layout.addWidget(url_card)
 
         self.reader = ReaderView()
         self.reader.progress_changed.connect(self._set_progress)
+        layout.addWidget(self.reader, 1)
 
-        controls = QHBoxLayout()
+        # Reader controls
+        toolbar = QFrame()
+        toolbar.setObjectName("readerToolbar")
+        controls = QHBoxLayout(toolbar)
+        controls.setContentsMargins(12, 9, 12, 9)
+        controls.setSpacing(7)
 
         self.previous_button = QPushButton("← Anterior")
         self.previous_button.clicked.connect(self.open_previous)
         self.previous_button.setEnabled(False)
 
         self.decrease_button = QPushButton("A−")
+        self.decrease_button.setObjectName("iconButton")
+        self.decrease_button.setToolTip("Diminuir fonte")
         self.decrease_button.clicked.connect(self.decrease_font)
 
         self.increase_button = QPushButton("A+")
+        self.increase_button.setObjectName("iconButton")
+        self.increase_button.setToolTip("Aumentar fonte")
         self.increase_button.clicked.connect(self.increase_font)
 
-        self.theme_button = QPushButton("Tema")
-        self.theme_button.clicked.connect(self.toggle_theme)
-
         self.favorite_button = QPushButton("☆")
+        self.favorite_button.setObjectName("iconButton")
         self.favorite_button.setToolTip("Favoritar livro atual")
         self.favorite_button.clicked.connect(self.toggle_current_favorite)
         self.favorite_button.setEnabled(False)
 
         self.current_library_button = QPushButton("＋ Library")
-        self.current_library_button.setToolTip("Adicionar/remover o livro atual da Library")
+        self.current_library_button.setToolTip(
+            "Adicionar/remover o livro atual da Library"
+        )
         self.current_library_button.clicked.connect(self.toggle_current_library)
         self.current_library_button.setEnabled(False)
 
-        self.fullscreen_button = QPushButton("Tela cheia")
+        self.fullscreen_button = QPushButton("⛶")
+        self.fullscreen_button.setObjectName("iconButton")
+        self.fullscreen_button.setToolTip("Tela cheia")
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
 
         self.progress_label = QLabel("0%")
+        self.progress_label.setObjectName("mutedLabel")
+        self.progress_label.setMinimumWidth(52)
         self.progress_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.next_button = QPushButton("Próximo →")
+        self.next_button.setObjectName("primaryButton")
         self.next_button.clicked.connect(self.open_next)
         self.next_button.setEnabled(False)
 
         controls.addWidget(self.previous_button)
         controls.addWidget(self.decrease_button)
         controls.addWidget(self.increase_button)
-        controls.addWidget(self.theme_button)
         controls.addWidget(self.favorite_button)
         controls.addWidget(self.current_library_button)
         controls.addStretch(1)
@@ -165,12 +219,9 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.fullscreen_button)
         controls.addWidget(self.next_button)
 
-        layout.addLayout(top)
-        layout.addWidget(self.reader, 1)
-        layout.addLayout(controls)
-
+        layout.addWidget(toolbar)
         self.setCentralWidget(root)
-        self.statusBar().showMessage("v0.5.1 — detalhes da obra, filtros e navegação por índice.")
+        self.statusBar().showMessage("Novel Reader 1.0.1 — pronto para ler.")
 
     def _build_library(self) -> None:
         self.library_panel = LibraryPanel(self.library_db, self)
@@ -226,7 +277,7 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self) -> None:
         self.setStyleSheet(DARK_STYLE if self.dark_mode else LIGHT_STYLE)
-        self.theme_button.setText("☀ Claro" if self.dark_mode else "☾ Escuro")
+        self.theme_button.setText("☀" if self.dark_mode else "☾")
 
     def open_preferences(self) -> None:
         dialog = PreferencesDialog(
@@ -539,7 +590,7 @@ class MainWindow(QMainWindow):
     def _set_loading(self, loading: bool) -> None:
         self.open_url_button.setEnabled(not loading)
         self.url_input.setEnabled(not loading)
-        self.open_url_button.setText("Carregando…" if loading else "Abrir")
+        self.open_url_button.setText("Abrindo…" if loading else "Abrir")
 
     def _set_progress(self, progress: int) -> None:
         self.progress_label.setText(f"{progress}%")

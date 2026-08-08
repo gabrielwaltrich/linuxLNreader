@@ -52,14 +52,15 @@ class LibraryPanel(QWidget):
         self._ascii_height = 18
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
 
-        header = QLabel("Biblioteca / Índice")
-        header.setStyleSheet("font-size: 18px; font-weight: 600;")
+        header = QLabel("Library")
+        header.setObjectName("sectionTitle")
         layout.addWidget(header)
 
         self.details = QFrame()
+        self.details.setObjectName("libraryDetails")
         details_layout = QVBoxLayout(self.details)
         details_layout.setContentsMargins(10, 10, 10, 10)
         details_layout.setSpacing(6)
@@ -77,7 +78,7 @@ class LibraryPanel(QWidget):
 
         self.book_title = QLabel("Selecione um livro")
         self.book_title.setWordWrap(True)
-        self.book_title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        self.book_title.setObjectName("sectionTitle")
         details_layout.addWidget(self.book_title)
 
         self.book_author = QLabel("")
@@ -89,6 +90,7 @@ class LibraryPanel(QWidget):
         details_layout.addWidget(self.book_stats)
 
         self.synopsis = QTextBrowser()
+        self.synopsis.setObjectName("librarySynopsis")
         self.synopsis.setMaximumHeight(115)
         self.synopsis.setOpenExternalLinks(False)
         self.synopsis.setPlaceholderText("Sinopse não disponível.")
@@ -96,6 +98,7 @@ class LibraryPanel(QWidget):
 
         continue_row = QHBoxLayout()
         self.continue_book_button = QPushButton("▶ Continuar leitura")
+        self.continue_book_button.setObjectName("primaryButton")
         self.continue_book_button.clicked.connect(self.continue_selected_book)
         self.first_unread_button = QPushButton("Próximo não lido")
         self.first_unread_button.clicked.connect(self.open_first_unread)
@@ -117,7 +120,7 @@ class LibraryPanel(QWidget):
 
         controls = QHBoxLayout()
         self.search = QLineEdit()
-        self.search.setPlaceholderText("Buscar livro ou capítulo…")
+        self.search.setPlaceholderText("Buscar por título, autor, tag ou capítulo…")
         self.search.textChanged.connect(self._apply_filter)
 
         self.filter_combo = QComboBox()
@@ -145,10 +148,12 @@ class LibraryPanel(QWidget):
         self.sync_button = QPushButton("↻ Atualizar índice")
         self.sync_button.clicked.connect(self.sync_selected)
 
-        self.favorite_button = QPushButton("★ Favoritar livro")
+        self.favorite_button = QPushButton("★ Favoritar")
+        self.favorite_button.setObjectName("accentButton")
         self.favorite_button.clicked.connect(self.toggle_selected_favorite)
 
         self.remove_button = QPushButton("Remover")
+        self.remove_button.setObjectName("dangerButton")
         self.remove_button.clicked.connect(self.remove_selected)
 
         buttons.addWidget(self.sync_button)
