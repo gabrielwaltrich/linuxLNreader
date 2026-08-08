@@ -11,6 +11,7 @@ from pathlib import Path
 
 from novel_reader.errors import NovelReaderError
 from novel_reader.models import Book, BookChapter, Chapter
+from novel_reader.services.webnovel_ranking import RankingBook
 
 
 class CliBrowserRuntime:
@@ -180,6 +181,22 @@ class CliBrowserRuntime:
     def load_dom(self, url: str) -> tuple[str, str]:
         data = self._request("dom", url)
         return data.get("final_url", url), data.get("html", "")
+
+    def load_ranking(self, url: str) -> list[RankingBook]:
+        data = self._request("ranking", url, timeout=max(self.timeout, 60.0))
+        return [
+            RankingBook(
+                rank=int(item.get("rank", 0)),
+                title=item.get("title", ""),
+                url=item.get("url", ""),
+                author=item.get("author", ""),
+                synopsis=item.get("synopsis", ""),
+                cover_url=item.get("cover_url", ""),
+                score_text=item.get("score_text", ""),
+            )
+            for item in data.get("books", [])
+            if item.get("url")
+        ]
 
     def _terminate_worker(self) -> None:
         if getattr(self, "process", None) is None:

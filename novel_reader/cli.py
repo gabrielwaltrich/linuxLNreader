@@ -12,6 +12,7 @@ from novel_reader.sources import SourceManager
 from novel_reader.terminal_reader import TerminalReaderSettings, interactive_read, paginate_chapter
 from novel_reader.cli_browser_runtime import CliBrowserRuntime
 from novel_reader.terminal_tui import run_book_tui
+from novel_reader.startup_tui import run_startup_tui
 
 
 def _load_with_browser(url: str, manager: SourceManager):
@@ -153,7 +154,7 @@ def run(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Novel Reader — modo terminal"
     )
-    parser.add_argument("url", help="URL pública de livro ou capítulo")
+    parser.add_argument("url", nargs="?", help="URL pública de livro ou capítulo")
     parser.add_argument(
         "-o",
         "--output",
@@ -185,6 +186,27 @@ def run(argv=None) -> int:
     args = parser.parse_args(argv)
 
     manager = SourceManager()
+
+    # No URL: launch the Reader home screen when running interactively.
+    if not args.url:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            parser.error("informe uma URL quando o CLI não estiver em um terminal interativo")
+        runtime = CliBrowserRuntime()
+        try:
+            reader_settings = TerminalReaderSettings(
+                width=args.width,
+                lines_per_page=args.lines,
+                margin=args.margin,
+                paragraph_spacing=args.paragraph_spacing,
+                text_size=args.text_size,
+            )
+            return run_startup_tui(
+                runtime=runtime,
+                database=LibraryDatabase(),
+                reader_settings=reader_settings,
+            )
+        finally:
+            runtime.close()
 
     try:
         kind = (

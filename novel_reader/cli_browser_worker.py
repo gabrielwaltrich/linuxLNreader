@@ -38,6 +38,7 @@ class BrowserWorker(QObject):
         self.session.loaded.connect(self._chapter_loaded)
         self.session.book_loaded.connect(self._book_loaded)
         self.session.dom_loaded.connect(self._dom_loaded)
+        self.session.ranking_loaded.connect(self._ranking_loaded)
         self.session.failed.connect(self._failed)
         self.session.status_changed.connect(self._status)
 
@@ -100,6 +101,8 @@ class BrowserWorker(QObject):
                 self.session.load(url)
             elif op == "dom":
                 self.session.load_dom(url)
+            elif op == "ranking":
+                self.session.load_ranking(url)
             else:
                 self.pending = None
                 self._send({
@@ -160,6 +163,22 @@ class BrowserWorker(QObject):
 
     def _dom_loaded(self, final_url: str, html: str) -> None:
         self._finish(data={"final_url": final_url, "html": html})
+
+    def _ranking_loaded(self, books) -> None:
+        self._finish(data={
+            "books": [
+                {
+                    "rank": item.rank,
+                    "title": item.title,
+                    "url": item.url,
+                    "author": item.author,
+                    "synopsis": item.synopsis,
+                    "cover_url": item.cover_url,
+                    "score_text": item.score_text,
+                }
+                for item in books
+            ]
+        })
 
     def _failed(self, message: str) -> None:
         self._finish(error=message)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import json
+from datetime import datetime, timezone
 import re
 import sqlite3
 from urllib.parse import urlparse
@@ -47,6 +49,11 @@ class BookEntry:
     cover_url: str = ""
     source_id: str = ""
     index_updated_at: str | None = None
+    library_category: str = "auto"
+    tags: str = ""
+    personal_rating: int = 0
+    pinned: bool = False
+    manual_library: bool = False
 
     @property
     def display_title(self) -> str:
@@ -158,6 +165,12 @@ class LibraryDatabase:
                 ("cover_url", "TEXT", "''"),
                 ("source_id", "TEXT", "''"),
                 ("index_updated_at", "TEXT", "NULL"),
+                ("library_hidden", "INTEGER", "0"),
+                ("library_category", "TEXT", "'auto'"),
+                ("tags", "TEXT", "''"),
+                ("personal_rating", "INTEGER", "0"),
+                ("pinned", "INTEGER", "0"),
+                ("manual_library", "INTEGER", "0"),
             ):
                 if name not in book_columns:
                     db.execute(
@@ -351,7 +364,8 @@ class LibraryDatabase:
             db.execute(
                 """
                 UPDATE books
-                SET source = ?, title = ?, last_opened = CURRENT_TIMESTAMP
+                SET source = ?, title = ?, last_opened = CURRENT_TIMESTAMP,
+                    library_hidden = 0
                 WHERE id = ?
                 """,
                 (chapter.source, chapter.book_title, book_id),
@@ -485,6 +499,11 @@ class LibraryDatabase:
                     b.cover_url,
                     b.source_id,
                     b.index_updated_at,
+                    b.library_category,
+                    b.tags,
+                    b.personal_rating,
+                    b.pinned,
+                    b.manual_library,
                     CASE
                         WHEN (
                             SELECT COUNT(*)
@@ -560,6 +579,8 @@ class LibraryDatabase:
                     OR EXISTS (
                         SELECT 1 FROM book_index bi WHERE bi.book_id = b.id
                     )
+                    OR COALESCE(b.manual_library, 0) = 1
+                    OR b.favorite = 1
                 ORDER BY b.favorite DESC, b.last_opened DESC
                 LIMIT ?
                 """,
@@ -619,7 +640,7 @@ class LibraryDatabase:
     def set_book_favorite(self, book_id: int, favorite: bool) -> None:
         with self._connect() as db:
             db.execute(
-                "UPDATE books SET favorite = ? WHERE id = ?",
+                "UPDATE books SET favorite = ?, library_hidden = 0 WHERE id = ?",
                 (1 if favorite else 0, int(book_id)),
             )
 
@@ -630,6 +651,325 @@ class LibraryDatabase:
         value = not book.favorite
         self.set_book_favorite(book.id, value)
         return value
+
+    def user_library_books(
+        self,
+        *,
+        limit: int = 500,
+        favorites_only: bool = False,
+        sort: str = "recent",
+    ) -> list[BookEntry]:
+        """Books the user actually read or explicitly favorited.
+
+        Merely browsing/syncing a book index does not put it in the user's
+        library unless it is favorited.
+        """
+        books = self.books(limit=max(limit * 3, 500))
+        result = []
+        with self._connect() as db:
+            for book in books:
+                row = db.execute(
+                    """
+                    SELECT
+                        COALESCE(b.library_hidden, 0) AS hidden,
+                        EXISTS(
+                            SELECT 1 FROM reading_history h
+                            WHERE h.book_id = b.id
+                        ) AS has_history,
+                        COALESCE(b.manual_library, 0) AS manual_library
+                    FROM books b
+                    WHERE b.id = ?
+                    """,
+                    (book.id,),
+                ).fetchone()
+                if not row or bool(row["hidden"]):
+                    continue
+                if favorites_only and not book.favorite:
+                    continue
+                if bool(row["has_history"]) or book.favorite or bool(row["manual_library"]):
+                    result.append(book)
+
+        if sort == "title":
+            result.sort(key=lambda item: (not item.pinned, item.display_title.casefold()))
+        elif sort == "favorites":
+            result.sort(
+                key=lambda item: (
+                    not item.pinned,
+                    not item.favorite,
+                    item.display_title.casefold(),
+                )
+            )
+        else:
+            # `books()` already returns favorite/recent order. We want true
+            # recent here while still keeping favorites visible.
+            result.sort(
+                key=lambda item: (item.pinned, item.last_opened or ""),
+                reverse=True,
+            )
+        return result[:limit]
+
+
+    def is_book_in_library(self, book_id: int) -> bool:
+        with self._connect() as db:
+            row = db.execute(
+                """
+                SELECT
+                    COALESCE(library_hidden, 0) AS hidden,
+                    COALESCE(manual_library, 0) AS manual_library,
+                    favorite,
+                    EXISTS(
+                        SELECT 1 FROM reading_history h WHERE h.book_id = books.id
+                    ) AS has_history
+                FROM books WHERE id = ?
+                """,
+                (int(book_id),),
+            ).fetchone()
+        return bool(
+            row
+            and not row["hidden"]
+            and (row["manual_library"] or row["favorite"] or row["has_history"])
+        )
+
+    def add_book_to_library(self, book_id: int, category: str = "planned") -> None:
+        category = category if category in {"auto", "reading", "completed", "planned"} else "planned"
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE books
+                SET manual_library = 1,
+                    library_hidden = 0,
+                    library_category = ?
+                WHERE id = ?
+                """,
+                (category, int(book_id)),
+            )
+
+    def toggle_book_library(self, book_id: int) -> bool:
+        if self.is_book_in_library(book_id):
+            self.hide_book_from_library(book_id)
+            return False
+        self.add_book_to_library(book_id, "planned")
+        return True
+
+    def set_book_category(self, book_id: int, category: str) -> None:
+        if category not in {"auto", "reading", "completed", "planned"}:
+            raise ValueError("categoria inválida")
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE books
+                SET library_category = ?, manual_library = 1, library_hidden = 0
+                WHERE id = ?
+                """,
+                (category, int(book_id)),
+            )
+
+    def effective_book_category(self, book: BookEntry) -> str:
+        if book.library_category in {"reading", "completed", "planned"}:
+            return book.library_category
+        stats = self.book_stats(book.id)
+        if stats.total > 0 and stats.completed >= stats.total:
+            return "completed"
+        if stats.read > 0:
+            return "reading"
+        return "planned"
+
+    def set_book_tags(self, book_id: int, tags: str) -> None:
+        normalized = ", ".join(
+            dict.fromkeys(
+                part.strip()
+                for part in str(tags).replace(";", ",").split(",")
+                if part.strip()
+            )
+        )
+        with self._connect() as db:
+            db.execute(
+                "UPDATE books SET tags = ?, manual_library = 1, library_hidden = 0 WHERE id = ?",
+                (normalized, int(book_id)),
+            )
+
+    def set_book_rating(self, book_id: int, rating: int) -> None:
+        rating = max(0, min(int(rating), 5))
+        with self._connect() as db:
+            db.execute(
+                "UPDATE books SET personal_rating = ?, manual_library = 1, library_hidden = 0 WHERE id = ?",
+                (rating, int(book_id)),
+            )
+
+    def toggle_book_pinned(self, book_id: int) -> bool:
+        book = self.get_book(book_id)
+        if not book:
+            return False
+        value = not book.pinned
+        with self._connect() as db:
+            db.execute(
+                "UPDATE books SET pinned = ?, manual_library = 1, library_hidden = 0 WHERE id = ?",
+                (1 if value else 0, int(book_id)),
+            )
+        return value
+
+    def ensure_catalog_book(
+        self,
+        *,
+        source: str,
+        title: str,
+        url: str,
+        author: str = "",
+        cover_url: str = "",
+        synopsis: str = "",
+    ) -> int:
+        with self._connect() as db:
+            key = self._book_key(source=source, title=title, url=url)
+            book_id = self._ensure_book(
+                db,
+                book_key=key,
+                source=source,
+                title=title,
+            )
+            db.execute(
+                """
+                UPDATE books
+                SET book_url = ?, author = ?, cover_url = ?, synopsis = ?
+                WHERE id = ?
+                """,
+                (url, author, cover_url, synopsis, book_id),
+            )
+        return book_id
+
+    def export_library_json(self, path: str | Path) -> Path:
+        target = Path(path).expanduser()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "format": "novel-reader-library",
+            "version": 1,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "books": [],
+        }
+        for book in self.user_library_books(limit=10000):
+            payload["books"].append({
+                "book_key": book.book_key,
+                "source": book.source,
+                "title": book.title,
+                "book_url": book.book_url,
+                "author": book.author,
+                "synopsis": book.synopsis,
+                "cover_url": book.cover_url,
+                "source_id": book.source_id,
+                "favorite": book.favorite,
+                "category": book.library_category,
+                "tags": book.tags,
+                "rating": book.personal_rating,
+                "pinned": book.pinned,
+                "chapters": [
+                    {
+                        "url": ch.url,
+                        "source": ch.source,
+                        "book_title": ch.book_title,
+                        "chapter_title": ch.chapter_title,
+                        "progress": ch.progress,
+                        "favorite": ch.favorite,
+                        "last_opened": ch.last_opened,
+                    }
+                    for ch in self.chapters_for_book(book.id)
+                ],
+            })
+        target.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return target
+
+    def import_library_json(self, path: str | Path) -> int:
+        source_path = Path(path).expanduser()
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
+        if payload.get("format") != "novel-reader-library":
+            raise ValueError("arquivo não é um backup do Novel Reader")
+        imported = 0
+        with self._connect() as db:
+            for item in payload.get("books", []):
+                title = str(item.get("title") or "").strip()
+                url = str(item.get("book_url") or "").strip()
+                if not title and not url:
+                    continue
+                source = str(item.get("source") or "WebNovel")
+                key = str(item.get("book_key") or self._book_key(
+                    source=source, title=title, url=url
+                ))
+                book_id = self._ensure_book(
+                    db,
+                    book_key=key,
+                    source=source,
+                    title=title,
+                )
+                db.execute(
+                    """
+                    UPDATE books SET
+                        book_url = ?, author = ?, synopsis = ?, cover_url = ?,
+                        source_id = ?, favorite = ?, library_hidden = 0,
+                        manual_library = 1, library_category = ?, tags = ?,
+                        personal_rating = ?, pinned = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        url,
+                        item.get("author", ""),
+                        item.get("synopsis", ""),
+                        item.get("cover_url", ""),
+                        item.get("source_id", ""),
+                        1 if item.get("favorite") else 0,
+                        item.get("category", "auto"),
+                        item.get("tags", ""),
+                        max(0, min(int(item.get("rating", 0)), 5)),
+                        1 if item.get("pinned") else 0,
+                        book_id,
+                    ),
+                )
+                for chapter in item.get("chapters", []):
+                    ch_url = str(chapter.get("url") or "")
+                    if not ch_url:
+                        continue
+                    db.execute(
+                        """
+                        INSERT INTO reading_history (
+                            url, source, book_title, chapter_title, progress,
+                            favorite, last_opened, book_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), ?)
+                        ON CONFLICT(url) DO UPDATE SET
+                            source = excluded.source,
+                            book_title = excluded.book_title,
+                            chapter_title = excluded.chapter_title,
+                            progress = MAX(reading_history.progress, excluded.progress),
+                            favorite = MAX(reading_history.favorite, excluded.favorite),
+                            book_id = excluded.book_id
+                        """,
+                        (
+                            ch_url,
+                            chapter.get("source", source),
+                            chapter.get("book_title", title),
+                            chapter.get("chapter_title", ""),
+                            max(0, min(int(chapter.get("progress", 0)), 100)),
+                            1 if chapter.get("favorite") else 0,
+                            chapter.get("last_opened"),
+                            book_id,
+                        ),
+                    )
+                imported += 1
+        return imported
+
+    def hide_book_from_library(self, book_id: int) -> None:
+        """Remove from the user-facing library without destroying history."""
+        with self._connect() as db:
+            db.execute(
+                "UPDATE books SET library_hidden = 1, favorite = 0, manual_library = 0 WHERE id = ?",
+                (int(book_id),),
+            )
+
+    def restore_book_to_library(self, book_id: int) -> None:
+        with self._connect() as db:
+            db.execute(
+                "UPDATE books SET library_hidden = 0 WHERE id = ?",
+                (int(book_id),),
+            )
 
     def remove_book(self, book_id: int) -> None:
         with self._connect() as db:
@@ -886,4 +1226,9 @@ class LibraryDatabase:
             cover_url=row["cover_url"] or "",
             source_id=row["source_id"] or "",
             index_updated_at=row["index_updated_at"],
+            library_category=(row["library_category"] or "auto") if "library_category" in row.keys() else "auto",
+            tags=(row["tags"] or "") if "tags" in row.keys() else "",
+            personal_rating=int(row["personal_rating"] or 0) if "personal_rating" in row.keys() else 0,
+            pinned=bool(row["pinned"]) if "pinned" in row.keys() else False,
+            manual_library=bool(row["manual_library"]) if "manual_library" in row.keys() else False,
         )

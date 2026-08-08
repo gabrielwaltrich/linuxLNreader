@@ -24,6 +24,65 @@ class TuiState:
     message: str = ""
 
 
+def run_book_tui_inplace(
+    stdscr,
+    *,
+    runtime,
+    book_url: str,
+    database: LibraryDatabase,
+    reader_settings: TerminalReaderSettings,
+) -> int:
+    """Run the book UI inside an already active curses session.
+
+    This is the path used by Home/Ranking/Library. It deliberately does not
+    call curses.wrapper(), endwin(), def_prog_mode() or reset_prog_mode().
+    """
+    _setup_terminal(stdscr)
+    try:
+        curses.flushinp()
+    except curses.error:
+        pass
+
+    _draw_loading(
+        stdscr,
+        "NOVEL READER",
+        "Carregando obra…",
+        "QtWebEngine está processando a página em segundo plano.",
+    )
+
+    try:
+        book = runtime.load_book(book_url)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        _draw_error(
+            stdscr,
+            "Não foi possível carregar a obra",
+            str(exc),
+        )
+        stdscr.getch()
+        return 1
+
+    app = NovelReaderTui(
+        runtime=runtime,
+        book=book,
+        database=database,
+        reader_settings=reader_settings,
+    )
+    result = app._main(stdscr)
+
+    # Throw away key sequences that may have been buffered while the nested
+    # view was closing (notably ESC [ A/B from arrow keys).
+    try:
+        curses.flushinp()
+    except curses.error:
+        pass
+    stdscr.keypad(True)
+    stdscr.erase()
+    stdscr.refresh()
+    return result
+
+
 def run_book_tui(
     *,
     runtime,
@@ -31,37 +90,16 @@ def run_book_tui(
     database: LibraryDatabase,
     reader_settings: TerminalReaderSettings,
 ) -> int:
-    """Own current terminal immediately and load the book inside curses."""
+    """Standalone entry point: owns the terminal with a single wrapper."""
 
     def wrapped(stdscr):
-        _setup_terminal(stdscr)
-        _draw_loading(
+        return run_book_tui_inplace(
             stdscr,
-            "NOVEL READER",
-            "Carregando obra…",
-            "QtWebEngine está processando a página em segundo plano.",
-        )
-
-        try:
-            book = runtime.load_book(book_url)
-        except KeyboardInterrupt:
-            return 130
-        except Exception as exc:
-            _draw_error(
-                stdscr,
-                "Não foi possível carregar a obra",
-                str(exc),
-            )
-            stdscr.getch()
-            return 1
-
-        app = NovelReaderTui(
             runtime=runtime,
-            book=book,
+            book_url=book_url,
             database=database,
             reader_settings=reader_settings,
         )
-        return app._main(stdscr)
 
     return curses.wrapper(wrapped)
 
@@ -241,10 +279,21 @@ class NovelReaderTui:
             if key in (ord("i"), ord("I")):
                 self._cover_mode_popup(stdscr)
                 continue
-            if key in (curses.KEY_UP, ord("k")):
+            if key in (ord("?"), curses.KEY_F2):
+                self._clear_graphics(stdscr)
+                self._kitty_diagnostics_popup(stdscr)
+                continue
+            if key in (ord("L"), ord("l")):
+                added = self.database.toggle_book_library(self.book_id)
+                self.state.message = "Adicionado à Library." if added else "Removido da Library."
+                continue
+            if key in (ord("A"), ord("a")):
+                self._prefetch_next(stdscr, entries)
+                continue
+            if key in (curses.KEY_UP, ord("k"), ord("K")):
                 self.state.selected = max(0, self.state.selected - 1)
                 continue
-            if key in (curses.KEY_DOWN, ord("j")):
+            if key in (curses.KEY_DOWN, ord("j"), ord("J")):
                 self.state.selected = min(max(0, len(entries) - 1), self.state.selected + 1)
                 continue
             if key in (curses.KEY_PPAGE,):
@@ -335,6 +384,49 @@ class NovelReaderTui:
             max(0, len(entries) - visible),
         )
 
+    def _draw_keybar(
+        self,
+        win,
+        y: int,
+        items,
+        *,
+        start_x: int = 2,
+    ) -> None:
+        """Draw compact keycaps: [K] Ação  [Enter] Ação."""
+        _, width = win.getmaxyx()
+        x = start_x
+
+        for key_label, action in items:
+            cap = f" {key_label} "
+            needed = len(cap) + 1 + len(action) + 2
+            if x + needed >= width - 1:
+                break
+
+            # Keycap
+            _safe_add(
+                win,
+                y,
+                x,
+                cap,
+                curses.A_BOLD | curses.A_REVERSE | _color(1),
+            )
+            x += len(cap)
+
+            # Action
+            _safe_add(
+                win,
+                y,
+                x,
+                f" {action}",
+                curses.A_DIM,
+            )
+            x += 1 + len(action)
+
+            # Separator
+            if x + 2 < width - 1:
+                _safe_add(win, y, x, "  ", curses.A_DIM)
+                x += 2
+
     def _draw_index(self, stdscr, entries) -> None:
         stdscr.erase()
         L = self._layout(stdscr)
@@ -420,9 +512,23 @@ class NovelReaderTui:
         footer_y = h - 3
         _hline(stdscr, footer_y, 1, max(0, w - 2), "─", curses.A_DIM)
 
-        help_left = "↑↓ mover  Enter abrir  / buscar  i capa  c continuar  u próximo  r atualizar"
-        _safe_add(stdscr, footer_y + 1, 2, help_left, curses.A_DIM)
-        _safe_add(stdscr, footer_y + 1, max(2, w - 10), "q sair", curses.A_BOLD)
+        self._draw_keybar(
+            stdscr,
+            footer_y + 1,
+            [
+                ("↑↓", "Mover"),
+                ("Enter", "Abrir"),
+                ("/", "Buscar"),
+                ("I", "Capa"),
+                ("?", "Kitty"),
+                ("L", "Library"),
+                ("A", "Offline"),
+                ("C", "Continuar"),
+                ("U", "Próximo"),
+                ("R", "Atualizar"),
+                ("Q", "Sair"),
+            ],
+        )
 
         if entries:
             selected = entries[self.state.selected]
@@ -575,6 +681,54 @@ class NovelReaderTui:
         )
         self._kitty_drawn = False
 
+    def _kitty_diagnostics_popup(self, stdscr) -> None:
+        h, w = stdscr.getmaxyx()
+        diag = self.cover_renderer.diagnostics(
+            screen_cols=w,
+            screen_rows=h,
+        )
+
+        popup_w = min(86, max(48, w - 8))
+        popup_h = min(16, max(11, h - 6))
+        win = curses.newwin(
+            popup_h,
+            popup_w,
+            max(0, (h - popup_h)//2),
+            max(0, (w - popup_w)//2),
+        )
+        win.keypad(True)
+
+        values = [
+            f"kitten: {diag.kitten_path or 'não encontrado'}",
+            f"terminal: {diag.terminal_name or 'desconhecido'}",
+            f"KITTY_WINDOW_ID: {diag.kitty_window_id or 'ausente'}",
+            f"células: {diag.cols}x{diag.rows}",
+            f"pixels reais/estimados: {diag.pixel_width}x{diag.pixel_height}",
+            f"tmux: {'sim' if diag.tmux else 'não'}",
+            f"screen: {'sim' if diag.screen else 'não'}",
+            f"estado: {diag.reason}",
+        ]
+
+        win.erase()
+        win.box()
+        _safe_add(
+            win,
+            0,
+            2,
+            " DIAGNÓSTICO KITTEN ICAT ",
+            curses.A_BOLD | _color(1),
+        )
+        row = 2
+        for text in values:
+            for line in textwrap.wrap(text, max(20, popup_w - 6)):
+                if row >= popup_h - 2:
+                    break
+                _safe_add(win, row, 3, line)
+                row += 1
+        _safe_add(win, popup_h - 1, 2, " qualquer tecla fecha · ? = diagnóstico ", curses.A_DIM)
+        win.refresh()
+        win.getch()
+
     def _cover_mode_popup(self, stdscr) -> None:
         self._clear_graphics(stdscr)
 
@@ -617,13 +771,13 @@ class NovelReaderTui:
                 win,
                 popup_h - 1,
                 2,
-                " ↑↓ escolher · Enter salvar · Esc cancelar ",
+                " ↑↓ escolher   Enter salvar   Esc cancelar ",
                 curses.A_DIM,
             )
             win.refresh()
 
             key = win.getch()
-            if key in (curses.KEY_UP, ord("k")):
+            if key in (curses.KEY_UP, ord("k"), ord("K")):
                 current = (current - 1) % len(modes)
             elif key in (curses.KEY_DOWN, ord("j")):
                 current = (current + 1) % len(modes)
@@ -636,6 +790,40 @@ class NovelReaderTui:
                 self._prepare_cover()
                 self.state.message = f"Capa: {modes[current][1]}"
                 return
+
+    def _prefetch_next(self, stdscr, entries) -> None:
+        if not entries:
+            return
+        count = max(0, min(int(self.ui_config.prefetch_count), 20))
+        if count <= 0:
+            self.state.message = "Prefetch está desativado."
+            return
+
+        start = self.state.selected + 1
+        candidates = [
+            item for item in entries[start:]
+            if item.accessible is not False
+        ][:count]
+        if not candidates:
+            self.state.message = "Não há próximos capítulos públicos para cache."
+            return
+
+        saved = 0
+        for idx, item in enumerate(candidates, start=1):
+            self.state.message = f"Cache offline {idx}/{len(candidates)}: {item.title}"
+            self._draw_index(stdscr, entries)
+            if self.cache.has(item.url):
+                saved += 1
+                continue
+            try:
+                chapter = self.runtime.load_chapter(item.url)
+                self.cache.save(chapter)
+                saved += 1
+            except Exception:
+                # Stop at first inaccessible/network failure; never attempt
+                # bypasses or alternate endpoints.
+                break
+        self.state.message = f"{saved}/{len(candidates)} próximo(s) capítulo(s) em cache."
 
     def _search_popup(self, stdscr) -> None:
         h, w = stdscr.getmaxyx()
@@ -752,6 +940,7 @@ class NovelReaderTui:
                 curses.KEY_NPAGE,
                 ord(" "),
                 ord("n"),
+                ord("N"),
             ):
                 if page < len(pages) - 1:
                     page += 1
@@ -761,6 +950,7 @@ class NovelReaderTui:
                 curses.KEY_UP,
                 curses.KEY_PPAGE,
                 ord("p"),
+                ord("P"),
             ):
                 if page > 0:
                     page -= 1
@@ -818,12 +1008,15 @@ class NovelReaderTui:
             f"Página {page + 1}/{len(pages)}  •  {percentage}%",
             curses.A_BOLD | _color(2),
         )
-        _safe_add(
+        self._draw_keybar(
             stdscr,
             h - 2,
-            max(2, w - 43),
-            "←/→ navegar  g ir para  q/ESC índice",
-            curses.A_DIM,
+            [
+                ("←→", "Página"),
+                ("G", "Ir para"),
+                ("Q/Esc", "Índice"),
+            ],
+            start_x=max(24, w // 2),
         )
         stdscr.refresh()
 

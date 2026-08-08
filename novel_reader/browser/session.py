@@ -7,6 +7,7 @@ from novel_reader.errors import AccessRestrictedError, NovelReaderError, ParseEr
 from novel_reader.models import Book, Chapter
 from novel_reader.sources.manager import SourceManager
 from novel_reader.services.book_sync import merge_books
+from novel_reader.services.webnovel_ranking import WebNovelRankingParser
 
 
 class BrowserSession(QObject):
@@ -19,6 +20,7 @@ class BrowserSession(QObject):
     loaded = Signal(object)
     book_loaded = Signal(object)
     dom_loaded = Signal(str, str)
+    ranking_loaded = Signal(object)
     failed = Signal(str)
     status_changed = Signal(str)
 
@@ -26,6 +28,11 @@ class BrowserSession(QObject):
     # cedo; as seguintes dão tempo extra para hidratação/renderização dinâmica.
     CAPTURE_DELAYS_MS = (500, 900, 1400, 2000, 2800, 3500, 4500, 5500)
     BOOK_STABLE_CAPTURES = 2
+    # Ranking cards are virtualized/lazy-rendered. Use many inexpensive
+    # samples instead of long waits. A full sweep now takes ~3s worst-case,
+    # versus ~10s previously, and can finish earlier after stabilization.
+    RANKING_CAPTURE_DELAYS_MS = (350,) + (120,) * 23
+    RANKING_STABLE_CAPTURES = 3
 
     def __init__(self, manager: SourceManager, parent=None):
         super().__init__(parent)
@@ -40,6 +47,11 @@ class BrowserSession(QObject):
         self._book_accumulator: Book | None = None
         self._book_last_count = 0
         self._book_stable_count = 0
+        self._ranking_accumulator = {}
+        self._ranking_parser = WebNovelRankingParser()
+        self._ranking_last_count = 0
+        self._ranking_stable_count = 0
+        self._ranking_last_signature = ()
 
         data_root = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.AppDataLocation
@@ -85,6 +97,10 @@ class BrowserSession(QObject):
         """Carrega uma página e devolve o DOM renderizado sem interpretá-lo."""
         self._start_load(url, mode="dom")
 
+    def load_ranking(self, url: str) -> None:
+        """Carrega ranking progressivamente, acumulando cards virtualizados."""
+        self._start_load(url, mode="ranking")
+
     def _start_load(self, url: str, *, mode: str) -> None:
         if self._busy:
             return
@@ -99,8 +115,14 @@ class BrowserSession(QObject):
         self._book_accumulator = None
         self._book_last_count = 0
         self._book_stable_count = 0
+        self._ranking_accumulator = {}
+        self._ranking_last_count = 0
+        self._ranking_stable_count = 0
+        self._ranking_last_signature = ()
         if mode == "book":
             self.status_changed.emit("Abrindo índice da obra no navegador embutido…")
+        elif mode == "ranking":
+            self.status_changed.emit("Abrindo ranking no navegador embutido…")
         else:
             self.status_changed.emit("Abrindo página no navegador embutido…")
         self.timeout_timer.start(35_000)
@@ -134,15 +156,22 @@ class BrowserSession(QObject):
     def _schedule_next_capture(self) -> None:
         if not self._busy:
             return
-        if self._capture_index >= len(self.CAPTURE_DELAYS_MS):
+        delays = (
+            self.RANKING_CAPTURE_DELAYS_MS
+            if self._mode == "ranking"
+            else self.CAPTURE_DELAYS_MS
+        )
+        if self._capture_index >= len(delays):
             self._fail_after_attempts()
             return
 
-        delay = self.CAPTURE_DELAYS_MS[self._capture_index]
+        delay = delays[self._capture_index]
         attempt = self._capture_index + 1
-        total = len(self.CAPTURE_DELAYS_MS)
+        total = len(delays)
         if self._mode == "book" and self._capture_index > 0:
             self._nudge_book_index()
+        elif self._mode == "ranking" and self._capture_index > 0:
+            self._nudge_ranking()
         self.status_changed.emit(
             f"Aguardando conteúdo dinâmico… tentativa {attempt}/{total}"
         )
@@ -154,7 +183,7 @@ class BrowserSession(QObject):
 
         generation = self._generation
         attempt = self._capture_index + 1
-        total = len(self.CAPTURE_DELAYS_MS)
+        total = len(self.RANKING_CAPTURE_DELAYS_MS) if self._mode == "ranking" else len(self.CAPTURE_DELAYS_MS)
         self.status_changed.emit(f"Extraindo texto… tentativa {attempt}/{total}")
 
         def receive_html(html: str) -> None:
@@ -162,6 +191,9 @@ class BrowserSession(QObject):
                 return
 
             final_url = self.page.url().toString() or self._requested_url
+            if self._mode == "ranking":
+                self._accept_ranking_capture(final_url, html)
+                return
             if self._mode == "dom":
                 self._finish()
                 self.dom_loaded.emit(final_url, html)
@@ -234,6 +266,85 @@ class BrowserSession(QObject):
 
         self._schedule_next_capture()
 
+    def _accept_ranking_capture(self, final_url: str, html: str) -> None:
+        for item in self._ranking_parser.parse(html, final_url):
+            current = self._ranking_accumulator.get(item.url)
+            if current is None or item.rank < current.rank:
+                self._ranking_accumulator[item.url] = item
+
+        items = sorted(
+            self._ranking_accumulator.values(),
+            key=lambda item: (item.rank, item.title.casefold()),
+        )
+        signature = tuple((item.rank, item.url) for item in items)
+
+        if (
+            len(items) == self._ranking_last_count
+            and signature == self._ranking_last_signature
+        ):
+            self._ranking_stable_count += 1
+        else:
+            self._ranking_stable_count = 0
+
+        self._ranking_last_count = len(items)
+        self._ranking_last_signature = signature
+
+        self.status_changed.emit(
+            f"Ranking: {len(items)} obras acumuladas; percorrendo a lista…"
+        )
+
+        self._capture_index += 1
+
+        # Do not stop near the top: virtualized lists may look stable there.
+        # After ~75% of the sweep, three identical captures means additional
+        # waiting is unlikely to add cards.
+        reached_late_sweep = (
+            self._capture_index
+            >= int(len(self.RANKING_CAPTURE_DELAYS_MS) * 0.75)
+        )
+        stable = (
+            reached_late_sweep
+            and self._ranking_stable_count >= self.RANKING_STABLE_CAPTURES
+        )
+
+        if stable or self._capture_index >= len(self.RANKING_CAPTURE_DELAYS_MS):
+            self._finish()
+            self.ranking_loaded.emit(items)
+            return
+
+        self._schedule_next_capture()
+
+    def _nudge_ranking(self) -> None:
+        total = max(1, len(self.RANKING_CAPTURE_DELAYS_MS) - 1)
+        fraction = min(1.0, self._capture_index / total)
+        script = f"""
+        (() => {{
+          const fraction = {fraction:.6f};
+          const pageMax = Math.max(
+            document.documentElement.scrollHeight,
+            document.body ? document.body.scrollHeight : 0
+          );
+          window.scrollTo(0, Math.floor(pageMax * fraction));
+
+          const candidates = [...document.querySelectorAll('*')].filter(el => {{
+            const style = getComputedStyle(el);
+            return /(auto|scroll)/.test(style.overflowY) &&
+                   el.scrollHeight > el.clientHeight + 200;
+          }});
+          for (const el of candidates.slice(0, 12)) {{
+            el.scrollTop = Math.floor(
+              (el.scrollHeight - el.clientHeight) * fraction
+            );
+          }}
+          return {{
+            y: window.scrollY,
+            height: pageMax,
+            fraction
+          }};
+        }})();
+        """
+        self.page.runJavaScript(script)
+
     def _nudge_book_index(self) -> None:
         """Interage apenas com controles normais da página para revelar o TOC.
 
@@ -275,6 +386,14 @@ class BrowserSession(QObject):
         self.page.runJavaScript(script)
 
     def _fail_after_attempts(self) -> None:
+        if self._mode == "ranking" and self._ranking_accumulator:
+            result = sorted(
+                self._ranking_accumulator.values(),
+                key=lambda item: (item.rank, item.title.casefold()),
+            )
+            self._finish()
+            self.ranking_loaded.emit(result)
+            return
         if self._mode == "book" and self._book_accumulator is not None:
             result = self._book_accumulator
             self._finish()
