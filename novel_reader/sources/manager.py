@@ -1,7 +1,7 @@
 from urllib.parse import urlparse
 
 from novel_reader.errors import UnsupportedSourceError
-from novel_reader.models import Chapter
+from novel_reader.models import Book, Chapter, UrlKind
 from novel_reader.services.downloader import DownloadedPage, PageDownloader
 from novel_reader.sources.base import NovelSource
 from novel_reader.sources.generic import GenericHtmlSource
@@ -28,6 +28,16 @@ class SourceManager:
 
         raise UnsupportedSourceError("Nenhuma fonte disponível para essa URL.")
 
+    def classify_url(self, url: str) -> UrlKind:
+        source = self.source_for(url)
+        return source.classify_url(url)
+
+    def is_book_url(self, url: str) -> bool:
+        return self.classify_url(url) is UrlKind.BOOK
+
+    def is_chapter_url(self, url: str) -> bool:
+        return self.classify_url(url) is UrlKind.CHAPTER
+
     def requires_browser(self, url: str) -> bool:
         return bool(self.source_for(url).requires_browser)
 
@@ -44,7 +54,7 @@ class SourceManager:
         final_url: str,
         html: str,
     ) -> Chapter:
-        """Interpreta um DOM já renderizado pelo QtWebEngine."""
+        """Interpreta um DOM de capítulo já renderizado pelo QtWebEngine."""
         source = self.source_for(final_url or requested_url)
         page = DownloadedPage(
             requested_url=requested_url,
@@ -53,3 +63,20 @@ class SourceManager:
             status_code=200,
         )
         return source.parse(page)
+
+    def parse_rendered_book_html(
+        self,
+        *,
+        requested_url: str,
+        final_url: str,
+        html: str,
+    ) -> Book:
+        """Interpreta o DOM renderizado da página raiz de uma obra."""
+        source = self.source_for(final_url or requested_url)
+        page = DownloadedPage(
+            requested_url=requested_url,
+            final_url=final_url or requested_url,
+            html=html,
+            status_code=200,
+        )
+        return source.parse_book(page)

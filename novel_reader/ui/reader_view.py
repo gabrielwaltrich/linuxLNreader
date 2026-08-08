@@ -1,6 +1,6 @@
 from html import escape
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QTextBrowser
 
@@ -12,6 +12,8 @@ class ReaderView(QTextBrowser):
         super().__init__(parent)
 
         self._font_size = 20
+        self._content_width = 760
+        self._line_height = 1.72
         self._title = ""
         self._chapter = ""
         self._text = ""
@@ -34,6 +36,22 @@ class ReaderView(QTextBrowser):
         self.setFont(font)
         self._render()
 
+    @property
+    def content_width(self) -> int:
+        return self._content_width
+
+    @property
+    def line_height(self) -> float:
+        return self._line_height
+
+    def set_content_width(self, width: int) -> None:
+        self._content_width = max(480, min(int(width), 1200))
+        self._render()
+
+    def set_line_height(self, value: float) -> None:
+        self._line_height = max(1.2, min(float(value), 2.4))
+        self._render()
+
     def set_chapter(self, title: str, chapter: str, text: str) -> None:
         self._title = title
         self._chapter = chapter
@@ -41,11 +59,22 @@ class ReaderView(QTextBrowser):
         self._render()
         self.verticalScrollBar().setValue(0)
 
+
+    def set_progress(self, progress: int) -> None:
+        progress = max(0, min(int(progress), 100))
+
+        def apply_progress() -> None:
+            scrollbar = self.verticalScrollBar()
+            maximum = scrollbar.maximum()
+            scrollbar.setValue(int(maximum * (progress / 100))) if maximum > 0 else None
+
+        QTimer.singleShot(0, apply_progress)
+
     def _render(self) -> None:
         if not self._text:
             self.setHtml(
-                """
-                <div style="max-width: 760px; margin: 90px auto; text-align:center;">
+                f"""
+                <div style="max-width: {self._content_width}px; margin: 90px auto; text-align:center;">
                     <h2>Nenhum capítulo aberto</h2>
                     <p>Use “Abrir TXT” ou “Carregar demonstração”.</p>
                 </div>
@@ -58,7 +87,7 @@ class ReaderView(QTextBrowser):
             paragraph = paragraph.strip()
             if paragraph:
                 paragraphs.append(
-                    f'<p style="line-height:1.72; margin:0 0 1.15em 0;">'
+                    f'<p style="line-height:{self._line_height}; margin:0 0 1.15em 0;">'
                     f'{escape(paragraph).replace(chr(10), "<br>")}</p>'
                 )
 
@@ -66,7 +95,7 @@ class ReaderView(QTextBrowser):
 
         self.setHtml(
             f"""
-            <div style="max-width: 760px; margin: 55px auto 120px auto;">
+            <div style="max-width: {self._content_width}px; margin: 55px auto 120px auto;">
                 <div style="text-align:center; margin-bottom:50px;">
                     <div style="font-size:0.70em; opacity:0.65;">{escape(self._title)}</div>
                     <h2 style="font-weight:600; margin-top:10px;">{escape(self._chapter)}</h2>

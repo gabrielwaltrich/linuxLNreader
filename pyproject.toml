@@ -1,13 +1,18 @@
 [project]
 name = "novel-reader"
-version = "0.3.1"
+version = "0.5.1.dev8.1.3"
 description = "Leitor minimalista de novels para Linux"
 requires-python = ">=3.10"
 dependencies = [
     "PySide6>=6.9",
     "httpx>=0.27",
     "beautifulsoup4>=4.12",
+    "Pillow>=10",
 ]
+
+[project.scripts]
+novel-reader = "novel_reader.app:run"
+novel-reader-cli = "novel_reader.cli:run"
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
@@ -15,22 +20,39 @@ dev = ["pytest>=8"]
 [tool.pyside6-project]
 files = [
     "main.py",
+    "cli.py",
     "novel_reader/__init__.py",
     "novel_reader/app.py",
+    "novel_reader/cli.py",
     "novel_reader/errors.py",
     "novel_reader/models.py",
     "novel_reader/styles.py",
+    "novel_reader/database/__init__.py",
+    "novel_reader/database/library.py",
     "novel_reader/browser/__init__.py",
     "novel_reader/browser/session.py",
     "novel_reader/services/__init__.py",
     "novel_reader/services/downloader.py",
+    "novel_reader/services/media_ascii.py",
     "novel_reader/sources/__init__.py",
     "novel_reader/sources/base.py",
     "novel_reader/sources/generic.py",
     "novel_reader/sources/manager.py",
     "novel_reader/sources/webnovel.py",
     "novel_reader/ui/__init__.py",
+    "novel_reader/ui/library_panel.py",
     "novel_reader/ui/main_window.py",
     "novel_reader/ui/reader_view.py",
     "novel_reader/ui/source_worker.py",
+    "novel_reader/ui/ascii_worker.py",
+    "novel_reader/ui/preferences_dialog.py",
+    "novel_reader/terminal_reader.py",
+    "novel_reader/services/chapter_cache.py",
+    "novel_reader/services/paragraph_comments.py",
+    "novel_reader/terminal_library.py",
+    "novel_reader/terminal_tui.py",
+    "novel_reader/terminal_config.py",
+    "novel_reader/terminal_cover.py",
+    "novel_reader/cli_browser_worker.py",
+    "novel_reader/cli_browser_runtime.py",
 ]

@@ -1,48 +1,58 @@
-# Novel Reader — v0.3.1 Browser Source
+# Novel Reader — v0.5
 
-A v0.3.1 resolve o principal limite encontrado na v0.2: algumas fontes recusam requisições HTTP simples ou montam o capítulo com JavaScript.
+Leitor minimalista de novels para Linux, com interface PySide6/Qt e Source Engine
+compartilhado entre GUI e CLI.
 
-## O que mudou
+## Destaques da v0.5
 
-- `WebNovelSource` agora declara `requires_browser = True`
-- páginas WebNovel são abertas com **QtWebEngine/Chromium**
-- o navegador executa JavaScript normalmente
-- depois do carregamento, o DOM renderizado é capturado com `toHtml()`
-- o DOM volta para o mesmo `SourceManager` e para o mesmo parser de `Chapter`
-- cookies e cache do navegador são persistentes entre execuções
-- páginas simples continuam usando o downloader HTTP leve da v0.2
-- nenhum mecanismo de desbloqueio, paywall ou automação de login foi adicionado
+A biblioteca agora é organizada por **livros**, e não apenas por uma lista plana
+de capítulos.
 
-## Arquitetura
+Cada livro mostra:
 
-```text
-                         URL
-                          │
-                          ▼
-                    SourceManager
-                     │          │
-          requires_browser     HTTP simples
-                     │          │
-                     ▼          ▼
-              BrowserSession  SourceWorker
-              QtWebEngine       httpx
-                     │          │
-             DOM renderizado    HTML
-                     └────┬─────┘
-                          ▼
-                     NovelSource
-                          │
-                          ▼
-                       Chapter
-                          │
-                          ▼
-                      ReaderView
-```
+- título;
+- último capítulo aberto;
+- progresso do último capítulo;
+- quantidade de capítulos conhecidos;
+- favorito do livro;
+- capítulos já acessados, expansíveis abaixo do livro.
+
+Também foi adicionada busca por livro/capítulo.
+
+## Migração automática da v0.4 / v0.4.1
+
+O arquivo `library.sqlite3` antigo é preservado.
+
+Na primeira execução da v0.5:
+
+1. a tabela `books` é criada;
+2. a coluna `book_id` é adicionada ao histórico existente;
+3. capítulos antigos são agrupados automaticamente;
+4. progresso e histórico permanecem disponíveis.
+
+Não é necessário apagar o banco antigo.
+
+## O que continua funcionando
+
+- WebNovel via QtWebEngine/Browser Source;
+- fallback HTTP para fontes simples;
+- leitura de TXT local;
+- tema claro/escuro;
+- tamanho de fonte;
+- tela cheia;
+- progresso automático;
+- Continuar última leitura;
+- capítulo anterior/próximo;
+- CLI;
+- exportação de capítulo pelo CLI.
 
 ## Instalação
 
+Em Ubuntu/Debian, caso o Qt reclame do plugin `xcb`, instale as dependências
+gráficas necessárias no sistema (por exemplo `libxcb-cursor0`) e execute o
+programa como seu usuário normal, não como root.
+
 ```bash
-cd novel-reader-v0.3.1
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
@@ -50,60 +60,67 @@ python -m pip install .
 python main.py
 ```
 
-O pacote `PySide6` instala os módulos Qt necessários, incluindo QtWebEngine nas distribuições suportadas.
+Após instalar, também é possível:
 
-### Dependências do sistema Linux
-
-QtWebEngine precisa de uma sessão gráfica funcional. Em distribuições Linux muito mínimas, podem faltar bibliotecas do Chromium/Qt. Em Ubuntu/Debian desktop normal, a instalação via `pip` geralmente já fornece os componentes Qt do lado Python.
-
-## Como testar o caso do WebNovel
-
-1. Abra `python main.py`.
-2. Cole uma URL pública de capítulo WebNovel.
-3. Clique em **Abrir**.
-4. A barra inferior deve mostrar etapas como:
-   - `Navegador: conectando…`
-   - `Navegador: carregando…`
-   - `Página carregada; aguardando conteúdo dinâmico…`
-   - `Extraindo texto da página renderizada…`
-5. Se o parser encontrar o capítulo público, ele será mostrado no Reader.
-
-A primeira abertura pode ser mais lenta porque o Chromium precisa inicializar seu perfil/cache.
-
-## Limites desta versão
-
-O navegador embutido não é mostrado visualmente. Isso significa que páginas que exijam interação humana, CAPTCHA ou login não podem ser concluídas nesta versão. O leitor também não tenta contornar esses mecanismos.
-
-Se o site mostrar um desafio de segurança mesmo dentro do QtWebEngine, a v0.3.1 apresentará erro em vez de tentar disfarçar o cliente ou burlar o desafio.
-
-## Estrutura nova
-
-```text
-novel_reader/
-├── browser/
-│   ├── __init__.py
-│   └── session.py
-├── services/
-│   └── downloader.py
-├── sources/
-│   ├── base.py
-│   ├── generic.py
-│   ├── manager.py
-│   └── webnovel.py
-└── ui/
-    ├── main_window.py
-    ├── reader_view.py
-    └── source_worker.py
+```bash
+novel-reader
 ```
 
-## Próximo passo sugerido — v0.4
+## CLI
 
-Depois de confirmar que o Browser Source consegue carregar seus capítulos de teste, a próxima versão pode adicionar uma janela de navegador visível opcional para sessões que precisem de interação legítima e, em seguida, a biblioteca SQLite com histórico e retomada de leitura.
+```bash
+novel-reader-cli "https://www.webnovel.com/book/..."
+```
 
-## Correções da v0.3.1
+Salvar:
 
-- Corrige falso positivo em capítulos gratuitos causado por textos globais como `Batch unlock chapters`.
-- Procura o texto real do capítulo antes de classificar uma página como bloqueada.
-- Faz capturas progressivas do DOM em 0,5 s, 1 s, 2 s e 4 s após o carregamento.
-- Só apresenta diagnóstico de bloqueio depois de esgotar as tentativas de conteúdo dinâmico.
-- Mantém a regra de não contornar paywall, login ou controles de acesso.
+```bash
+novel-reader-cli "https://www.webnovel.com/book/..." -o capitulo.txt
+```
+
+## Atalhos
+
+| Atalho | Ação |
+|---|---|
+| `Ctrl+B` | Mostrar/ocultar biblioteca |
+| `Ctrl+R` | Continuar última leitura |
+| `Ctrl+D` | Favoritar/desfavoritar livro atual |
+| `Ctrl+O` | Abrir TXT |
+| `Alt+←` | Capítulo anterior |
+| `Alt+→` | Próximo capítulo |
+| `+` / `=` | Aumentar fonte |
+| `-` | Diminuir fonte |
+| `T` | Tema |
+| `F` | Tela cheia |
+| `Esc` | Sair da tela cheia |
+
+## Banco da v0.5
+
+```text
+books
+├── id
+├── book_key
+├── source
+├── title
+├── favorite
+└── last_opened
+
+reading_history
+├── url
+├── book_id  ───────→ books.id
+├── source
+├── book_title
+├── chapter_title
+├── progress
+├── favorite (compatibilidade v0.4)
+└── last_opened
+```
+
+O `book_key` tenta usar um identificador estável da fonte. Para WebNovel, o
+identificador do livro presente na URL é usado para evitar duplicatas mesmo se
+o título mudar.
+
+## Escopo
+
+O Reader não contorna paywall, CAPTCHA, login ou controle de acesso. Ele apenas
+processa conteúdo que a sessão/página disponibiliza normalmente.
