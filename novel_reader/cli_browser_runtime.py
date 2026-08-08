@@ -7,6 +7,7 @@ import queue
 import subprocess
 import sys
 import threading
+from collections import deque
 from pathlib import Path
 
 from novel_reader.errors import NovelReaderError
@@ -30,20 +31,34 @@ class CliBrowserRuntime:
         # The worker is only used for pages the user explicitly asks to open.
         env.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
 
+        # Critical for distro packages: cli.py lives in /opt/novel-reader,
+        # while the worker is started with "python -m". The child must see the
+        # application root even when the user launches novel-reader-cli from
+        # ~/ or any unrelated working directory.
+        app_root = Path(__file__).resolve().parents[1]
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            str(app_root)
+            if not existing_pythonpath
+            else str(app_root) + os.pathsep + existing_pythonpath
+        )
+
         self.timeout = float(timeout)
         self._closed = False
         self._request_id = 0
         self._lock = threading.Lock()
         self._responses: queue.Queue[str | None] = queue.Queue()
+        self._stderr_tail = deque(maxlen=20)
 
         self.process = subprocess.Popen(
             [sys.executable, "-m", "novel_reader.cli_browser_worker"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
             env=env,
+            cwd=str(app_root),
             start_new_session=True,
         )
 
@@ -53,7 +68,35 @@ class CliBrowserRuntime:
             daemon=True,
         )
         self._reader.start()
+
+        self._stderr_reader = threading.Thread(
+            target=self._stderr_loop,
+            name="novel-reader-browser-stderr",
+            daemon=True,
+        )
+        self._stderr_reader.start()
+
         atexit.register(self._close_at_exit)
+
+    def _stderr_loop(self) -> None:
+        stderr = self.process.stderr
+        if stderr is None:
+            return
+        try:
+            for line in stderr:
+                line = line.rstrip()
+                if line:
+                    self._stderr_tail.append(line)
+        except Exception:
+            pass
+
+    def _worker_crash_message(self, prefix: str) -> str:
+        code = self.process.poll()
+        tail = list(self._stderr_tail)
+        detail = tail[-1] if tail else ""
+        if detail:
+            return f"{prefix} (código {code}). Detalhe: {detail}"
+        return f"{prefix} (código {code})."
 
     @property
     def alive(self) -> bool:
@@ -89,8 +132,9 @@ class CliBrowserRuntime:
         with self._lock:
             if not self.alive:
                 raise NovelReaderError(
-                    f"O processo do navegador terminou inesperadamente "
-                    f"(código {self.process.returncode})."
+                    self._worker_crash_message(
+                        "O processo do navegador terminou inesperadamente"
+                    )
                 )
 
             self._request_id += 1
@@ -125,8 +169,9 @@ class CliBrowserRuntime:
 
                 if line is None:
                     raise NovelReaderError(
-                        f"O navegador encerrou durante a operação "
-                        f"(código {self.process.poll()})."
+                        self._worker_crash_message(
+                            "O navegador encerrou durante a operação"
+                        )
                     )
 
                 try:
@@ -215,6 +260,29 @@ class CliBrowserRuntime:
                 synopsis=item.get("synopsis", ""),
                 cover_url=item.get("cover_url", ""),
                 score_text=item.get("score_text", ""),
+                source_rank=int(item.get("source_rank", item.get("rank", 0)) or 0),
+            )
+            for item in data.get("books", [])
+            if item.get("url")
+        ]
+
+    def load_more_ranking(self, url: str, status_callback=None) -> list[RankingBook]:
+        data = self._request(
+            "ranking_more",
+            url,
+            timeout=max(self.timeout, 20.0),
+            status_callback=status_callback,
+        )
+        return [
+            RankingBook(
+                rank=int(item.get("rank", 0)),
+                title=item.get("title", ""),
+                url=item.get("url", ""),
+                author=item.get("author", ""),
+                synopsis=item.get("synopsis", ""),
+                cover_url=item.get("cover_url", ""),
+                score_text=item.get("score_text", ""),
+                source_rank=int(item.get("source_rank", item.get("rank", 0)) or 0),
             )
             for item in data.get("books", [])
             if item.get("url")

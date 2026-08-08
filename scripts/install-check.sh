@@ -94,6 +94,13 @@ else
   fail "comando novel-reader não encontrado"
 fi
 
+if PYTHONPATH="/opt/novel-reader${PYTHONPATH:+:$PYTHONPATH}" \
+  "$PYTHON" -c "import novel_reader.cli_browser_worker" >/dev/null 2>&1; then
+  ok "worker QtWebEngine importável"
+else
+  fail "worker QtWebEngine não pode ser importado de /opt/novel-reader"
+fi
+
 echo
 echo "Opcionais:"
 

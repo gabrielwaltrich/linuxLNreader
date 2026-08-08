@@ -71,7 +71,7 @@ class MainWindow(QMainWindow):
         self.progress_timer.setInterval(650)
         self.progress_timer.timeout.connect(self._save_current_progress)
 
-        self.setWindowTitle("Novel Reader 1.0.1")
+        self.setWindowTitle("Novel Reader 1.0.9")
         self.resize(1320, 860)
 
         self._build_ui()
@@ -221,7 +221,7 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(toolbar)
         self.setCentralWidget(root)
-        self.statusBar().showMessage("Novel Reader 1.0.1 — pronto para ler.")
+        self.statusBar().showMessage("Novel Reader 1.0.9 — pronto para ler.")
 
     def _build_library(self) -> None:
         self.library_panel = LibraryPanel(self.library_db, self)

@@ -723,6 +723,17 @@ class NovelReaderTui:
     def _clear_graphics(self, stdscr) -> None:
         if not self._kitty_drawn:
             return
+        self._force_clear_graphics(stdscr)
+
+    def _force_clear_graphics(self, stdscr) -> None:
+        """Clear Kitty graphics even if another TUI screen drew the image.
+
+        Ranking/Home and Book Reader can use different renderer instances in
+        the same curses session. Relying only on this instance's
+        ``_kitty_drawn`` flag can leave an old cover floating over chapter
+        text. Entering reading mode therefore sends an unconditional Kitty
+        clear command.
+        """
         h, w = stdscr.getmaxyx()
         self.cover_renderer.clear_kitty(
             screen_cols=w,
@@ -1127,7 +1138,12 @@ class NovelReaderTui:
             raise
 
     def _open_reader(self, stdscr, url: str) -> None:
-        self._clear_graphics(stdscr)
+        # Reading mode is deliberately text-only. Clear *all* Kitty images,
+        # including covers drawn by Ranking/Home with another renderer.
+        self._force_clear_graphics(stdscr)
+        stdscr.erase()
+        stdscr.refresh()
+
         self.state.message = "Abrindo capítulo…"
         self._draw_index(stdscr, self._entries())
 
@@ -1138,12 +1154,31 @@ class NovelReaderTui:
             self.state.message = f"{error.title} — veja {error.log_file}"
             return
 
+        # The index redraw above may have painted the book cover again while
+        # the chapter was loading. Clear once more immediately before reading.
+        self._force_clear_graphics(stdscr)
+
         old_progress = self.database.progress_for(url)
         self.database.record_chapter(chapter, old_progress)
 
         title = f"{chapter.display_book_title} — {chapter.display_chapter_title}"
         pages = paginate_chapter(title, chapter.text, self.reader_settings)
         page = page_index_from_progress(old_progress, len(pages))
+
+        def repaginate(*, keep_progress: bool = True) -> None:
+            nonlocal pages, page
+            progress = progress_from_page(page, len(pages)) if keep_progress else 0
+            pages = paginate_chapter(title, chapter.text, self.reader_settings)
+            page = page_index_from_progress(progress, len(pages))
+
+        def save_reader_preferences() -> None:
+            self.app_config = self.app_config_store.update(
+                terminal_width=self.reader_settings.width,
+                lines_per_page=self.reader_settings.lines_per_page,
+                terminal_margin=self.reader_settings.margin,
+                paragraph_spacing=self.reader_settings.paragraph_spacing,
+                text_size=self.reader_settings.text_size,
+            )
 
         while True:
             self._draw_reader(stdscr, pages, page, title)
@@ -1176,6 +1211,64 @@ class NovelReaderTui:
                 target = self._goto_page_popup(stdscr, len(pages))
                 if target is not None:
                     page = target
+                continue
+
+            # Terminal emulators own the physical font size. These shortcuts
+            # adjust reading density/wrapping, which is portable in curses.
+            if key in (ord("+"), ord("=")):
+                presets = ("small", "normal", "large")
+                current = (
+                    self.reader_settings.text_size
+                    if self.reader_settings.text_size in presets
+                    else "normal"
+                )
+                index = min(len(presets) - 1, presets.index(current) + 1)
+                self.reader_settings.text_size = presets[index]
+                repaginate()
+                save_reader_preferences()
+                continue
+
+            if key in (ord("-"), ord("_")):
+                presets = ("small", "normal", "large")
+                current = (
+                    self.reader_settings.text_size
+                    if self.reader_settings.text_size in presets
+                    else "normal"
+                )
+                index = max(0, presets.index(current) - 1)
+                self.reader_settings.text_size = presets[index]
+                repaginate()
+                save_reader_preferences()
+                continue
+
+            if key in (ord("w"), ord("W")):
+                widths = (60, 72, 82, 96, 110)
+                current = min(
+                    range(len(widths)),
+                    key=lambda idx: abs(widths[idx] - self.reader_settings.width),
+                )
+                self.reader_settings.width = widths[(current + 1) % len(widths)]
+                repaginate()
+                save_reader_preferences()
+                continue
+
+            if key == ord("["):
+                self.reader_settings.paragraph_spacing = max(
+                    0,
+                    self.reader_settings.paragraph_spacing - 1,
+                )
+                repaginate()
+                save_reader_preferences()
+                continue
+
+            if key == ord("]"):
+                self.reader_settings.paragraph_spacing = min(
+                    3,
+                    self.reader_settings.paragraph_spacing + 1,
+                )
+                repaginate()
+                save_reader_preferences()
+                continue
 
         progress = progress_from_page(page, len(pages))
         self.database.save_progress(url, progress)
@@ -1218,11 +1311,19 @@ class NovelReaderTui:
 
         _hline(stdscr, h - 3, 1, max(0, w - 2), "─", curses.A_DIM)
         percentage = round(((page + 1) / max(1, len(pages))) * 100)
+        size_label = {
+            "small": "compacto",
+            "normal": "normal",
+            "large": "grande",
+        }.get(self.reader_settings.text_size, "normal")
         _safe_add(
             stdscr,
             h - 2,
             2,
-            f"Página {page + 1}/{len(pages)}  •  {percentage}%",
+            (
+                f"Página {page + 1}/{len(pages)}  •  {percentage}%  "
+                f"• Texto {size_label}  • Largura {self.reader_settings.width}"
+            ),
             curses.A_BOLD | _color(2),
         )
         self._draw_keybar(
@@ -1230,10 +1331,13 @@ class NovelReaderTui:
             h - 2,
             [
                 ("←→", "Página"),
-                ("G", "Ir para"),
+                ("+/-", "Texto"),
+                ("W", "Largura"),
+                ("[]", "Parágrafo"),
+                ("G", "Ir"),
                 ("Q/Esc", "Índice"),
             ],
-            start_x=max(24, w // 2),
+            start_x=max(44, w // 2),
         )
         stdscr.refresh()
 

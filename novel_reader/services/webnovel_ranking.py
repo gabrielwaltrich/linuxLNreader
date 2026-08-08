@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -31,128 +32,226 @@ class RankingBook:
     synopsis: str = ""
     cover_url: str = ""
     score_text: str = ""
+    source_rank: int = 0
+
+
+def normalize_loaded_ranking(items: list[RankingBook]) -> list[RankingBook]:
+    """Sort by the authoritative WebNovel position without renumbering.
+
+    The old implementation assigned new contiguous UI ranks to sparse captures.
+    That made displayed positions diverge from WebNovel. ``rank`` now always
+    remains the source position.
+    """
+    dedup: dict[str, RankingBook] = {}
+    for item in items:
+        key = item.url.casefold()
+        current = dedup.get(key)
+        source_rank = item.source_rank or item.rank
+        if current is None or source_rank < (current.source_rank or current.rank):
+            if not item.source_rank:
+                item.source_rank = item.rank
+            dedup[key] = item
+
+    return sorted(
+        dedup.values(),
+        key=lambda item: (
+            item.source_rank or item.rank,
+            item.title.casefold(),
+        ),
+    )
 
 
 class WebNovelRankingParser:
-    """Parse the public Fan-Fic Power Ranking page.
+    """Parser for WebNovel Fan-Fic Power Ranking.
 
-    The title links currently point to /book/<slug_or_id>; "Read" links tend to
-    point deeper into the book and are intentionally ignored.
+    Current page structure provides two independent sources for position:
+    1. JSON-LD ItemList in <head> with URL + official ``position``.
+    2. ``i.ff_number`` inside each rendered card.
+
+    JSON-LD is authoritative because it is semantic page metadata and avoids
+    confusing ``strong.ff_number`` (Power) with the ranking position.
     """
 
     BOOK_RE = re.compile(r"/book/([^/?#]+)", re.I)
 
     def parse(self, html: str, page_url: str) -> list[RankingBook]:
         soup = BeautifulSoup(html or "", "html.parser")
+        position_map = self._jsonld_positions(soup, page_url)
+
+        cards = self._ranking_cards(soup)
         results: list[RankingBook] = []
         seen: set[str] = set()
 
-        for anchor in soup.find_all("a", href=True):
+        for card in cards:
+            anchor = self._book_anchor(card)
+            if anchor is None:
+                continue
+
             href = str(anchor.get("href") or "").strip()
-            match = self.BOOK_RE.search(href)
-            if not match:
+            absolute_url = urljoin(page_url, href)
+            book_key = self._book_key(absolute_url)
+            if not book_key or book_key in seen:
                 continue
 
-            parsed_href = urlparse(urljoin(page_url, href))
-            parts = [p for p in parsed_href.path.split("/") if p]
-
-            # Book title links have exactly /book/<book-key>. Chapter/"Read"
-            # links have additional path segments and are excluded.
-            if "book" not in parts:
-                continue
-            idx = parts.index("book")
-            tail = parts[idx + 1:]
-            if len(tail) != 1:
+            title = self._clean(
+                anchor.get("title")
+                or anchor.get_text(" ", strip=True)
+            )
+            if not title:
                 continue
 
-            book_key = tail[0].casefold()
-            if book_key in seen:
-                continue
-
-            title = self._clean(anchor.get_text(" ", strip=True))
-            if not title or title.casefold() in {
-                "read", "add in library", "add to library", "book"
-            }:
-                continue
-
-            card = self._find_card(anchor)
-            card_text = self._clean(card.get_text(" ", strip=True)) if card else title
-
-            rank = self._extract_rank(card_text)
+            semantic_rank = position_map.get(book_key)
+            dom_rank = self._extract_dom_rank(card)
+            rank = semantic_rank or dom_rank
             if rank is None:
-                # A ranking title without a numeric position is likely a
-                # recommendation/navigation link rather than the ranked list.
                 continue
 
             seen.add(book_key)
             results.append(
                 RankingBook(
                     rank=rank,
+                    source_rank=rank,
                     title=title,
-                    url=f"{parsed_href.scheme or 'https'}://{parsed_href.netloc}/book/{tail[0]}",
+                    url=absolute_url,
                     author=self._extract_author(card, title),
                     synopsis=self._extract_synopsis(card, title),
                     cover_url=self._extract_cover(card, page_url),
-                    score_text=self._extract_score(card_text),
+                    score_text=self._extract_power(card),
                 )
             )
 
-        results.sort(key=lambda item: item.rank)
-        return results
+        # Compatibility fallback for older cached HTML/fixtures without the
+        # current wrapper. It still requires a zero-padded rank and a single
+        # root book link; arbitrary Power numbers are never accepted.
+        if not results:
+            results = self._parse_legacy_cards(soup, page_url)
 
-    def _find_card(self, anchor):
-        # Walk upward until a compact container contains a rank AND only one
-        # root book link. This prevents page-level containers from making
-        # unrelated recommendation links inherit rank 001/002 from the list.
-        node = anchor
-        for _ in range(8):
-            node = getattr(node, "parent", None)
-            if node is None:
-                break
+        return normalize_loaded_ranking(results)
 
-            text = self._clean(node.get_text(" ", strip=True))
-            if len(text) > 6000:
-                break
+    def _ranking_cards(self, soup) -> list:
+        wrapper = soup.select_one(".j_rank_wrapper")
+        if wrapper is not None:
+            direct = [
+                node
+                for node in wrapper.find_all(recursive=False)
+                if node.select_one("i.ff_number") is not None
+                and self._root_book_link_count(node) == 1
+            ]
+            if direct:
+                return direct
 
-            has_rank = bool(
-                re.search(r"(?:^|\s)0*\d{1,3}(?:\s|$)", text)
+        # Compatibility with compact HTML snapshots/tests: walk upward from
+        # i.ff_number and choose the smallest ancestor containing exactly one
+        # root book link. The tag may be section, div, article, etc.
+        cards = []
+        seen_nodes: set[int] = set()
+        for marker in soup.select("i.ff_number"):
+            node = marker
+            card = None
+            for _ in range(8):
+                node = getattr(node, "parent", None)
+                if node is None:
+                    break
+                if self._root_book_link_count(node) == 1:
+                    card = node
+                    break
+            if card is not None and id(card) not in seen_nodes:
+                seen_nodes.add(id(card))
+                cards.append(card)
+        return cards
+
+    def _root_book_link_count(self, node) -> int:
+        keys: set[str] = set()
+        for anchor in node.find_all("a", href=True):
+            key = self._book_key(
+                urljoin(
+                    "https://www.webnovel.com",
+                    str(anchor.get("href") or ""),
+                )
             )
-            if not has_rank:
+            if key:
+                keys.add(key)
+        return len(keys)
+
+    def _jsonld_positions(self, soup, page_url: str) -> dict[str, int]:
+        positions: dict[str, int] = {}
+        for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+            raw = script.string or script.get_text()
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except (TypeError, ValueError, json.JSONDecodeError):
                 continue
 
-            root_book_links = 0
-            for link in node.find_all("a", href=True):
-                href = str(link.get("href") or "")
-                match = self.BOOK_RE.search(href)
-                if not match:
+            candidates = payload if isinstance(payload, list) else [payload]
+            for obj in candidates:
+                if not isinstance(obj, dict):
                     continue
-                parsed = urlparse(urljoin("https://www.webnovel.com", href))
-                parts = [p for p in parsed.path.split("/") if p]
-                if "book" not in parts:
+                if obj.get("@type") != "ItemList":
                     continue
-                idx = parts.index("book")
-                if len(parts[idx + 1:]) == 1:
-                    root_book_links += 1
+                for item in obj.get("itemListElement") or []:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        position = int(item.get("position"))
+                    except (TypeError, ValueError):
+                        continue
+                    url = str(item.get("url") or "")
+                    key = self._book_key(urljoin(page_url, url))
+                    if key and 1 <= position <= 10000:
+                        positions[key] = position
+        return positions
 
-            if root_book_links == 1:
-                return node
+    def _book_anchor(self, card):
+        # Prefer the actual title link. The thumbnail is a useful fallback.
+        for selector in (
+            "h3 a[href*='/book/']",
+            "a.c_l[href*='/book/']",
+            "a.g_thumb[href*='/book/']",
+        ):
+            anchor = card.select_one(selector)
+            if anchor is not None:
+                return anchor
 
+        for anchor in card.find_all("a", href=True):
+            href = str(anchor.get("href") or "")
+            key = self._book_key(urljoin("https://www.webnovel.com", href))
+            if key:
+                return anchor
         return None
 
+    def _book_key(self, url: str) -> str:
+        parsed = urlparse(url)
+        parts = [part for part in parsed.path.split("/") if part]
+        if "book" not in parts:
+            return ""
+        idx = parts.index("book")
+        tail = parts[idx + 1:]
+        if len(tail) != 1:
+            return ""
+        return tail[0].casefold()
+
     @staticmethod
-    def _extract_rank(text: str) -> int | None:
-        # Current page presents ranks as 001, 002, ...
-        match = re.search(r"(?:^|\s)(\d{1,3})(?:\s|$)", text)
+    def _extract_dom_rank(card) -> int | None:
+        marker = card.select_one("i.ff_number")
+        if marker is None:
+            return None
+        text = marker.get_text(" ", strip=True)
+        match = re.fullmatch(r"0*(\d{1,4})", text.strip())
         if not match:
             return None
         value = int(match.group(1))
-        if value <= 0 or value > 999:
-            return None
-        return value
+        return value if 1 <= value <= 10000 else None
 
     def _extract_author(self, card, title: str) -> str:
-        if card is None:
-            return ""
+        # Current cards put author after the category separator as:
+        # <strong class="c_l ...">Author</strong>
+        for node in card.select("p strong.c_l"):
+            text = self._clean(node.get_text(" ", strip=True))
+            if text and text != title:
+                return text
+
         for selector in (
             "a[href*='/profile/']",
             "a[href*='/author/']",
@@ -162,50 +261,113 @@ class WebNovelRankingParser:
                 text = self._clean(node.get_text(" ", strip=True))
                 if text and text != title:
                     return text
-
-        # Current ranking cards often end metadata with "·Author".
-        text = self._clean(card.get_text(" ", strip=True))
-        matches = re.findall(r"·\s*([A-Za-z0-9_][A-Za-z0-9_\- ]{1,80})", text)
-        if matches:
-            return matches[-1].strip()
         return ""
 
     def _extract_synopsis(self, card, title: str) -> str:
-        if card is None:
-            return ""
+        # Current ranking description paragraph.
+        node = card.select_one("p.fw400.lh20.fs14")
+        if node is not None:
+            text = self._clean(node.get_text(" ", strip=True))
+            if text and title.casefold() not in text.casefold():
+                return text[:1200]
+
         candidates = []
-        for node in card.find_all(["p", "div"]):
+        for node in card.find_all("p"):
             text = self._clean(node.get_text(" ", strip=True))
             if (
-                len(text) >= 50
+                len(text) >= 40
                 and title.casefold() not in text.casefold()
                 and "add in library" not in text.casefold()
             ):
                 candidates.append(text)
-        if candidates:
-            return max(candidates, key=len)[:700]
-        return ""
+        return max(candidates, key=len)[:1200] if candidates else ""
+
+    @staticmethod
+    def _extract_power(card) -> str:
+        container = card.select_one("strong.ff_number")
+        if container is None:
+            return ""
+        node = container.select_one("span")
+        if node is None:
+            return ""
+        value = WebNovelRankingParser._clean(node.get_text(" ", strip=True))
+        return (
+            value
+            if re.fullmatch(r"\d+(?:\.\d+)?[KMB]?", value, re.I)
+            else ""
+        )
 
     @staticmethod
     def _extract_cover(card, page_url: str) -> str:
-        if card is None:
-            return ""
-        image = card.find("img")
-        if not image:
+        image = card.select_one(
+            "a.g_thumb img[data-original], "
+            "a.g_thumb img[src], "
+            "img[data-original], img[src], img[data-src]"
+        )
+        if image is None:
             return ""
         value = (
-            image.get("src")
+            image.get("data-original")
+            or image.get("src")
             or image.get("data-src")
-            or image.get("data-original")
             or ""
         )
-        return urljoin(page_url, str(value)) if value else ""
+        value = str(value).strip()
+        return urljoin(page_url, value) if value else ""
 
-    @staticmethod
-    def _extract_score(text: str) -> str:
-        # Power values on the current page look like 5.8K, 906, 1.6K.
-        match = re.search(r"(?:^|\s)(\d+(?:\.\d+)?[KMB]?)(?:\||\s)", text, re.I)
-        return match.group(1) if match else ""
+    def _parse_legacy_cards(self, soup, page_url: str) -> list[RankingBook]:
+        results: list[RankingBook] = []
+        seen: set[str] = set()
+
+        for anchor in soup.find_all("a", href=True):
+            absolute = urljoin(page_url, str(anchor.get("href") or ""))
+            key = self._book_key(absolute)
+            if not key or key in seen:
+                continue
+
+            node = anchor
+            card = None
+            for _ in range(8):
+                node = getattr(node, "parent", None)
+                if node is None:
+                    break
+                text = self._clean(node.get_text(" ", strip=True))
+                if len(text) > 6000:
+                    break
+                if node.select_one("strong.ff_number") is not None:
+                    continue
+                if self._root_book_link_count(node) != 1:
+                    continue
+                if re.search(r"(?:^|\s)0\d{2}(?:\s|$)", text):
+                    card = node
+                    break
+
+            if card is None:
+                continue
+
+            card_text = self._clean(card.get_text(" ", strip=True))
+            match = re.search(r"(?:^|\s)(0\d{2})(?:\s|$)", card_text)
+            if not match:
+                continue
+            rank = int(match.group(1))
+            title = self._clean(anchor.get_text(" ", strip=True))
+            if not title or title.casefold() == "read":
+                continue
+
+            seen.add(key)
+            results.append(
+                RankingBook(
+                    rank=rank,
+                    source_rank=rank,
+                    title=title,
+                    url=absolute,
+                    author=self._extract_author(card, title),
+                    synopsis=self._extract_synopsis(card, title),
+                    cover_url=self._extract_cover(card, page_url),
+                    score_text="",
+                )
+            )
+        return results
 
     @staticmethod
     def _clean(text: str) -> str:

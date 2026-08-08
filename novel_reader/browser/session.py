@@ -7,7 +7,7 @@ from novel_reader.errors import AccessRestrictedError, NovelReaderError, ParseEr
 from novel_reader.models import Book, Chapter
 from novel_reader.sources.manager import SourceManager
 from novel_reader.services.book_sync import merge_books
-from novel_reader.services.webnovel_ranking import WebNovelRankingParser
+from novel_reader.services.webnovel_ranking import WebNovelRankingParser, normalize_loaded_ranking
 
 
 class BrowserSession(QObject):
@@ -28,10 +28,12 @@ class BrowserSession(QObject):
     # cedo; as seguintes dão tempo extra para hidratação/renderização dinâmica.
     CAPTURE_DELAYS_MS = (500, 900, 1400, 2000, 2800, 3500, 4500, 5500)
     BOOK_STABLE_CAPTURES = 2
-    # Ranking cards are virtualized/lazy-rendered. Use many inexpensive
-    # samples instead of long waits. A full sweep now takes ~3s worst-case,
-    # versus ~10s previously, and can finish earlier after stabilization.
-    RANKING_CAPTURE_DELAYS_MS = (350,) + (120,) * 23
+    # Ranking is loaded in user-driven batches. The initial request gets
+    # the first ~20 cards quickly; later requests reveal one more batch.
+    RANKING_BATCH_SIZE = 20
+    RANKING_TARGET_COUNT = 250
+    RANKING_CAPTURE_DELAYS_MS = (350, 250, 300, 400, 500, 650, 800)
+    RANKING_MORE_DELAYS_MS = (250, 300, 400, 500, 650, 800, 1000)
     RANKING_STABLE_CAPTURES = 3
 
     def __init__(self, manager: SourceManager, parent=None):
@@ -52,6 +54,7 @@ class BrowserSession(QObject):
         self._ranking_last_count = 0
         self._ranking_stable_count = 0
         self._ranking_last_signature = ()
+        self._ranking_batch_start_count = 0
 
         data_root = QStandardPaths.writableLocation(
             QStandardPaths.StandardLocation.AppDataLocation
@@ -98,8 +101,43 @@ class BrowserSession(QObject):
         self._start_load(url, mode="dom")
 
     def load_ranking(self, url: str) -> None:
-        """Carrega ranking progressivamente, acumulando cards virtualizados."""
+        """Load only the first ranking batch for fast TUI startup."""
         self._start_load(url, mode="ranking")
+
+    def load_more_ranking(self, url: str) -> None:
+        """Reveal approximately one additional ranking batch.
+
+        Reuses the already loaded page and accumulator. If the browser is on a
+        different ranking URL, it reloads that URL and starts from batch one.
+        """
+        if self._busy:
+            return
+
+        current = self.page.url().toString()
+        if not current or current.split("#", 1)[0] != url.split("#", 1)[0]:
+            self._start_load(url, mode="ranking")
+            return
+
+        self._busy = True
+        self._generation += 1
+        self._mode = "ranking_more"
+        self._requested_url = url
+        self._capture_index = 0
+        self._ranking_batch_start_count = len(self._ranking_accumulator)
+        self._ranking_last_count = len(self._ranking_accumulator)
+        self._ranking_stable_count = 0
+        self._ranking_last_signature = tuple(
+            sorted(
+                (item.rank, item.url)
+                for item in self._ranking_accumulator.values()
+            )
+        )
+        self.status_changed.emit(
+            f"Carregando mais obras… {self._ranking_batch_start_count} carregadas"
+        )
+        self.timeout_timer.start(12_000)
+        self._nudge_ranking()
+        self._schedule_next_capture()
 
     def _start_load(self, url: str, *, mode: str) -> None:
         if self._busy:
@@ -119,6 +157,7 @@ class BrowserSession(QObject):
         self._ranking_last_count = 0
         self._ranking_stable_count = 0
         self._ranking_last_signature = ()
+        self._ranking_batch_start_count = 0
         if mode == "book":
             self.status_changed.emit("Abrindo índice da obra no navegador embutido…")
         elif mode == "ranking":
@@ -156,11 +195,12 @@ class BrowserSession(QObject):
     def _schedule_next_capture(self) -> None:
         if not self._busy:
             return
-        delays = (
-            self.RANKING_CAPTURE_DELAYS_MS
-            if self._mode == "ranking"
-            else self.CAPTURE_DELAYS_MS
-        )
+        if self._mode == "ranking":
+            delays = self.RANKING_CAPTURE_DELAYS_MS
+        elif self._mode == "ranking_more":
+            delays = self.RANKING_MORE_DELAYS_MS
+        else:
+            delays = self.CAPTURE_DELAYS_MS
         if self._capture_index >= len(delays):
             self._fail_after_attempts()
             return
@@ -170,8 +210,11 @@ class BrowserSession(QObject):
         total = len(delays)
         if self._mode == "book" and self._capture_index > 0:
             self._nudge_book_index()
-        elif self._mode == "ranking" and self._capture_index > 0:
-            self._nudge_ranking()
+        elif self._mode in ("ranking", "ranking_more") and self._capture_index > 0:
+            # Initial ranking should not race to 250. It gets one small nudge
+            # only if the first DOM did not contain a full batch.
+            if self._mode == "ranking_more" or self._ranking_last_count < self.RANKING_BATCH_SIZE:
+                self._nudge_ranking()
         self.status_changed.emit(
             f"Aguardando conteúdo dinâmico… tentativa {attempt}/{total}"
         )
@@ -183,7 +226,12 @@ class BrowserSession(QObject):
 
         generation = self._generation
         attempt = self._capture_index + 1
-        total = len(self.RANKING_CAPTURE_DELAYS_MS) if self._mode == "ranking" else len(self.CAPTURE_DELAYS_MS)
+        if self._mode == "ranking":
+            total = len(self.RANKING_CAPTURE_DELAYS_MS)
+        elif self._mode == "ranking_more":
+            total = len(self.RANKING_MORE_DELAYS_MS)
+        else:
+            total = len(self.CAPTURE_DELAYS_MS)
         self.status_changed.emit(f"Extraindo texto… tentativa {attempt}/{total}")
 
         def receive_html(html: str) -> None:
@@ -191,7 +239,7 @@ class BrowserSession(QObject):
                 return
 
             final_url = self.page.url().toString() or self._requested_url
-            if self._mode == "ranking":
+            if self._mode in ("ranking", "ranking_more"):
                 self._accept_ranking_capture(final_url, html)
                 return
             if self._mode == "dom":
@@ -289,62 +337,117 @@ class BrowserSession(QObject):
         self._ranking_last_count = len(items)
         self._ranking_last_signature = signature
 
-        total_captures = len(self.RANKING_CAPTURE_DELAYS_MS)
-        current_capture = min(self._capture_index + 1, total_captures)
-        self.status_changed.emit(
-            f"Ranking: {len(items)} obras encontradas · "
-            f"captura {current_capture}/{total_captures}"
-        )
+        if self._mode == "ranking_more":
+            delays = self.RANKING_MORE_DELAYS_MS
+            wanted = min(
+                self.RANKING_TARGET_COUNT,
+                self._ranking_batch_start_count + self.RANKING_BATCH_SIZE,
+            )
+            self.status_changed.emit(
+                f"Carregando mais obras… {len(items)}/{wanted}"
+            )
+        else:
+            delays = self.RANKING_CAPTURE_DELAYS_MS
+            wanted = min(self.RANKING_BATCH_SIZE, self.RANKING_TARGET_COUNT)
+            self.status_changed.emit(
+                f"Ranking: {len(items)} obras carregadas"
+            )
 
         self._capture_index += 1
 
-        # Do not stop near the top: virtualized lists may look stable there.
-        # After ~75% of the sweep, three identical captures means additional
-        # waiting is unlikely to add cards.
-        reached_late_sweep = (
-            self._capture_index
-            >= int(len(self.RANKING_CAPTURE_DELAYS_MS) * 0.75)
+        max_rank = max(
+            (item.source_rank or item.rank for item in items),
+            default=0,
         )
-        stable = (
-            reached_late_sweep
-            and self._ranking_stable_count >= self.RANKING_STABLE_CAPTURES
+        target_reached = (
+            len(items) >= wanted
+            or max_rank >= self.RANKING_TARGET_COUNT
         )
+        stable = self._ranking_stable_count >= self.RANKING_STABLE_CAPTURES
+        exhausted_attempts = self._capture_index >= len(delays)
 
-        if stable or self._capture_index >= len(self.RANKING_CAPTURE_DELAYS_MS):
+        if target_reached or stable or exhausted_attempts:
             self._finish()
-            self.ranking_loaded.emit(items)
+            self.ranking_loaded.emit(normalize_loaded_ranking(items))
             return
 
         self._schedule_next_capture()
 
     def _nudge_ranking(self) -> None:
-        total = max(1, len(self.RANKING_CAPTURE_DELAYS_MS) - 1)
-        fraction = min(1.0, self._capture_index / total)
-        script = f"""
-        (() => {{
-          const fraction = {fraction:.6f};
+        """Force the public ranking page to reveal lazy-loaded batches.
+
+        WebNovel initially renders only a small batch (commonly 20). Moving to
+        the bottom repeatedly triggers the site's normal lazy-loading path.
+        This does not bypass access controls; it mirrors ordinary page scroll.
+        """
+        script = r"""
+        (() => {
+          const wrapper = document.querySelector('.j_rank_wrapper');
+          const cards = wrapper
+            ? [...wrapper.querySelectorAll(':scope > section')]
+            : [...document.querySelectorAll('section')].filter(
+                el => el.querySelector('i.ff_number')
+              );
+
+          // Put the last visible ranking card into view first. Intersection
+          // observers often use this exact condition to request the next batch.
+          const last = cards.length ? cards[cards.length - 1] : null;
+          if (last) {
+            try {
+              last.scrollIntoView({block: 'end', behavior: 'instant'});
+            } catch (_) {
+              last.scrollIntoView(false);
+            }
+          }
+
+          // Then force all plausible scrolling surfaces to their bottom.
           const pageMax = Math.max(
             document.documentElement.scrollHeight,
             document.body ? document.body.scrollHeight : 0
           );
-          window.scrollTo(0, Math.floor(pageMax * fraction));
+          window.scrollTo(0, pageMax);
 
-          const candidates = [...document.querySelectorAll('*')].filter(el => {{
+          const scrollables = [...document.querySelectorAll('*')].filter(el => {
             const style = getComputedStyle(el);
             return /(auto|scroll)/.test(style.overflowY) &&
-                   el.scrollHeight > el.clientHeight + 200;
-          }});
-          for (const el of candidates.slice(0, 12)) {{
-            el.scrollTop = Math.floor(
-              (el.scrollHeight - el.clientHeight) * fraction
-            );
-          }}
-          return {{
+                   el.scrollHeight > el.clientHeight + 100;
+          });
+          for (const el of scrollables.slice(0, 20)) {
+            el.scrollTop = el.scrollHeight;
+            try {
+              el.dispatchEvent(new Event('scroll', {bubbles: true}));
+            } catch (_) {}
+          }
+
+          // If the site exposes a normal visible Load/View More control, use
+          // it exactly as a user would. Never touch login/paywall controls.
+          const labels = ['load more', 'view more', 'show more', 'more'];
+          for (const node of document.querySelectorAll(
+            'button, a, [role="button"]'
+          )) {
+            const text = (node.innerText || node.textContent || '')
+              .trim().toLowerCase();
+            if (!labels.some(label => text === label || text.includes(label))) {
+              continue;
+            }
+            const rect = node.getBoundingClientRect();
+            const style = getComputedStyle(node);
+            const visible = rect.width > 0 && rect.height > 0 &&
+                            style.display !== 'none' &&
+                            style.visibility !== 'hidden';
+            if (visible) {
+              try { node.click(); } catch (_) {}
+              break;
+            }
+          }
+
+          window.dispatchEvent(new Event('scroll'));
+          return {
+            cards: cards.length,
             y: window.scrollY,
-            height: pageMax,
-            fraction
-          }};
-        }})();
+            height: pageMax
+          };
+        })();
         """
         self.page.runJavaScript(script)
 
@@ -389,13 +492,13 @@ class BrowserSession(QObject):
         self.page.runJavaScript(script)
 
     def _fail_after_attempts(self) -> None:
-        if self._mode == "ranking" and self._ranking_accumulator:
+        if self._mode in ("ranking", "ranking_more") and self._ranking_accumulator:
             result = sorted(
                 self._ranking_accumulator.values(),
                 key=lambda item: (item.rank, item.title.casefold()),
             )
             self._finish()
-            self.ranking_loaded.emit(result)
+            self.ranking_loaded.emit(normalize_loaded_ranking(result))
             return
         if self._mode == "book" and self._book_accumulator is not None:
             result = self._book_accumulator

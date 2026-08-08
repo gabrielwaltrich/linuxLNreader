@@ -223,6 +223,45 @@ class StartupTui:
         books = []
         message = ""
         loaded_period = None
+        exhausted_periods: set[str] = set()
+
+        def maybe_load_more(period: str, books: list, selected: int) -> tuple[list, str]:
+            if (
+                self.app_config.offline_mode
+                or period in exhausted_periods
+                or not books
+                or len(books) >= 250
+                or selected < max(0, len(books) - 3)
+            ):
+                return books, ""
+
+            before = len(books)
+            self._clear_ranking_native()
+
+            def more_status(text: str):
+                if text:
+                    self._draw_ranking_loading(
+                        period_label=RANKING_PERIODS[period_index][1],
+                        message=text,
+                    )
+
+            try:
+                try:
+                    updated = self.runtime.load_more_ranking(
+                        ranking_url(period),
+                        status_callback=more_status,
+                    )
+                except TypeError:
+                    updated = self.runtime.load_more_ranking(ranking_url(period))
+            except Exception as exc:
+                return books, f"Falha ao carregar mais: {exc}"
+
+            if len(updated) <= before:
+                exhausted_periods.add(period)
+                return books, f"{before} obras carregadas · fim dos itens disponíveis."
+
+            self._ranking_cache[period] = updated
+            return updated, f"{len(updated)} obras carregadas."
 
         while True:
             period = RANKING_PERIODS[period_index][0]
@@ -255,7 +294,7 @@ class StartupTui:
                         except TypeError:
                             books = self.runtime.load_ranking(ranking_url(period))
                         self._ranking_cache[period] = books
-                        message = f"{len(books)} obras encontradas."
+                        message = f"{len(books)} obras carregadas · desça para carregar mais."
                     loaded_period = period
                     selected = 0
                     offset = 0
@@ -291,12 +330,18 @@ class StartupTui:
                 continue
             if key in (curses.KEY_DOWN, ord("j"), ord("J")) and books:
                 selected = min(len(books) - 1, selected + 1)
+                books, more_message = maybe_load_more(period, books, selected)
+                if more_message:
+                    message = more_message
                 continue
             if key == curses.KEY_PPAGE and books:
                 selected = max(0, selected - 10)
                 continue
             if key == curses.KEY_NPAGE and books:
                 selected = min(len(books) - 1, selected + 10)
+                books, more_message = maybe_load_more(period, books, selected)
+                if more_message:
+                    message = more_message
                 continue
             if key in (10, 13, curses.KEY_ENTER) and books:
                 self._clear_ranking_native()

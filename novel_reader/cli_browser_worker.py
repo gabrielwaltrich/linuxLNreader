@@ -123,6 +123,8 @@ class BrowserWorker(QObject):
                 self.session.load_dom(url)
             elif op == "ranking":
                 self.session.load_ranking(url)
+            elif op == "ranking_more":
+                self.session.load_more_ranking(url)
             else:
                 self.pending = None
                 self._send({
@@ -195,6 +197,7 @@ class BrowserWorker(QObject):
                     "synopsis": item.synopsis,
                     "cover_url": item.cover_url,
                     "score_text": item.score_text,
+                    "source_rank": item.source_rank,
                 }
                 for item in books
             ]
