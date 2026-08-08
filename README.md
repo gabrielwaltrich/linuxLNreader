@@ -1,6 +1,7 @@
 # Novel Reader for Linux
+# Suporte oficial da 1.0 apenas para o site WEBNOVEL
 
-Leitor de **novels e webnovels para Linux**, com interface gráfica e uma TUI
+Leitor de **lightnovels e webnovels para Linux**, com interface gráfica e uma TUI
 completa para terminal.
 
 O projeto nasceu com foco em uma experiência de leitura confortável no Linux,
