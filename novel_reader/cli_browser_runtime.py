@@ -81,6 +81,7 @@ class CliBrowserRuntime:
         url: str = "",
         *,
         timeout: float | None = None,
+        status_callback=None,
     ) -> dict:
         if self._closed:
             raise NovelReaderError("O navegador já foi encerrado.")
@@ -136,6 +137,14 @@ class CliBrowserRuntime:
                 if response.get("id") != request_id:
                     continue
 
+                if response.get("type") == "status":
+                    if status_callback is not None:
+                        try:
+                            status_callback(str(response.get("message") or ""))
+                        except Exception:
+                            pass
+                    continue
+
                 if not response.get("ok"):
                     raise NovelReaderError(
                         str(response.get("error") or "Falha no navegador.")
@@ -143,8 +152,12 @@ class CliBrowserRuntime:
 
                 return response.get("data") or {}
 
-    def load_book(self, url: str) -> Book:
-        data = self._request("book", url)
+    def load_book(self, url: str, status_callback=None) -> Book:
+        data = self._request(
+            "book",
+            url,
+            status_callback=status_callback,
+        )
         return Book(
             source=data.get("source", ""),
             url=data.get("url", url),
@@ -166,8 +179,12 @@ class CliBrowserRuntime:
             ],
         )
 
-    def load_chapter(self, url: str) -> Chapter:
-        data = self._request("chapter", url)
+    def load_chapter(self, url: str, status_callback=None) -> Chapter:
+        data = self._request(
+            "chapter",
+            url,
+            status_callback=status_callback,
+        )
         return Chapter(
             source=data.get("source", ""),
             url=data.get("url", url),
@@ -182,8 +199,13 @@ class CliBrowserRuntime:
         data = self._request("dom", url)
         return data.get("final_url", url), data.get("html", "")
 
-    def load_ranking(self, url: str) -> list[RankingBook]:
-        data = self._request("ranking", url, timeout=max(self.timeout, 60.0))
+    def load_ranking(self, url: str, status_callback=None) -> list[RankingBook]:
+        data = self._request(
+            "ranking",
+            url,
+            timeout=max(self.timeout, 60.0),
+            status_callback=status_callback,
+        )
         return [
             RankingBook(
                 rank=int(item.get("rank", 0)),

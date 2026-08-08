@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from novel_reader.ui.ascii_worker import AsciiCoverWorker
+from novel_reader.services.search_service import fuzzy_match
 
 from novel_reader.database import (
     BookEntry,
@@ -499,7 +500,19 @@ class LibraryPanel(QWidget):
 
         for i in range(self.tree.topLevelItemCount()):
             book_item = self.tree.topLevelItem(i)
-            book_match = query in book_item.text(0).casefold()
+            book_id = book_item.data(0, self.ID_ROLE)
+            book = self.database.get_book(int(book_id)) if book_id is not None else None
+            book_match = (
+                not query
+                or fuzzy_match(
+                    query,
+                    book_item.text(0),
+                    book.author if book else "",
+                    book.tags if book else "",
+                    self.database.effective_book_category(book) if book else "",
+                    threshold=55,
+                )
+            )
 
             child_match = False
             for j in range(book_item.childCount()):

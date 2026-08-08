@@ -1,6 +1,6 @@
 [project]
 name = "novel-reader"
-version = "0.5.1.dev8.2.1"
+version = "1.0.0rc1"
 description = "Leitor minimalista de novels para Linux"
 requires-python = ">=3.10"
 dependencies = [
@@ -52,6 +52,18 @@ files = [
     "novel_reader/terminal_library.py",
     "novel_reader/terminal_tui.py",
     "novel_reader/terminal_config.py",
+    "novel_reader/setup_assistant.py",
+    "novel_reader/error_handling.py",
+    "novel_reader/app_config.py",
+    "novel_reader/services/cache_manager.py",
+    "novel_reader/services/sync_policy.py",
+    "novel_reader/services/search_service.py",
+    "novel_reader/services/data_safety.py",
+    "novel_reader/services/instance_lock.py",
+    "novel_reader/services/self_test.py",
+    "novel_reader/services/compatibility_report.py",
+    "novel_reader/logging_setup.py",
+    "novel_reader/system_diagnostics.py",
     "novel_reader/services/webnovel_ranking.py",
     "novel_reader/startup_tui.py",
     "novel_reader/terminal_cover.py",

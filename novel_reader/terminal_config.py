@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-import json
+from dataclasses import dataclass
 from pathlib import Path
 
-
-COVER_MODES = ("auto", "kitty", "chafa", "pillow", "off")
+from novel_reader.app_config import (
+    COVER_MODES,
+    AppConfigStore,
+    migrate_legacy_terminal_config,
+)
 
 
 @dataclass(slots=True)
@@ -15,30 +17,33 @@ class TerminalUiConfig:
 
     def normalized(self) -> "TerminalUiConfig":
         mode = self.cover_mode if self.cover_mode in COVER_MODES else "auto"
-        return TerminalUiConfig(cover_mode=mode, prefetch_count=max(0, min(int(self.prefetch_count), 20)))
+        return TerminalUiConfig(
+            cover_mode=mode,
+            prefetch_count=max(0, min(int(self.prefetch_count), 20)),
+        )
 
 
 class TerminalConfigStore:
+    """Compatibility layer for older TUI code.
+
+    Reads/writes the centralized AppConfig instead of a separate cli.json.
+    """
+
     def __init__(self, path: str | Path | None = None):
-        if path is None:
-            path = Path.home() / ".config" / "novel-reader" / "cli.json"
-        self.path = Path(path)
+        self._app_store = AppConfigStore(path)
+        migrate_legacy_terminal_config(self._app_store)
+        self.path = self._app_store.path
 
     def load(self) -> TerminalUiConfig:
-        if not self.path.exists():
-            return TerminalUiConfig()
-        try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-            return TerminalUiConfig(
-                cover_mode=str(data.get("cover_mode", "auto")),
-                prefetch_count=int(data.get("prefetch_count", 3)),
-            ).normalized()
-        except Exception:
-            return TerminalUiConfig()
+        cfg = self._app_store.load()
+        return TerminalUiConfig(
+            cover_mode=cfg.cover_mode,
+            prefetch_count=cfg.prefetch_count,
+        ).normalized()
 
     def save(self, config: TerminalUiConfig) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(asdict(config.normalized()), indent=2),
-            encoding="utf-8",
+        normalized = config.normalized()
+        self._app_store.update(
+            cover_mode=normalized.cover_mode,
+            prefetch_count=normalized.prefetch_count,
         )

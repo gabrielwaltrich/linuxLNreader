@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import json
+import os
 from datetime import datetime, timezone
 import re
 import sqlite3
@@ -95,16 +96,33 @@ class BookStats:
 
 
 class LibraryDatabase:
+    SCHEMA_VERSION = 7
+
+    @staticmethod
+    def default_path() -> Path:
+        try:
+            from PySide6.QtCore import QStandardPaths
+            location = QStandardPaths.writableLocation(
+                QStandardPaths.StandardLocation.AppDataLocation
+            )
+            if location:
+                data_dir = Path(location)
+            else:
+                raise RuntimeError("Qt não retornou AppDataLocation")
+        except Exception:
+            base = os.environ.get("XDG_DATA_HOME")
+            data_dir = (
+                Path(base).expanduser() / "novel-reader"
+                if base
+                else Path.home() / ".local" / "share" / "novel-reader"
+            )
+
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir / "library.sqlite3"
+
     def __init__(self, path: str | Path | None = None):
         if path is None:
-            from PySide6.QtCore import QStandardPaths
-            data_dir = Path(
-                QStandardPaths.writableLocation(
-                    QStandardPaths.StandardLocation.AppDataLocation
-                )
-            )
-            data_dir.mkdir(parents=True, exist_ok=True)
-            path = data_dir / "library.sqlite3"
+            path = self.default_path()
 
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +132,7 @@ class LibraryDatabase:
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 5000")
         return connection
 
     def _initialize(self) -> None:
@@ -213,6 +232,9 @@ class LibraryDatabase:
             )
 
             self._migrate_history_to_books(db)
+        with self._connect() as db:
+            db.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+
 
     def _migrate_history_to_books(self, db: sqlite3.Connection) -> None:
         rows = db.execute(
@@ -978,6 +1000,27 @@ class LibraryDatabase:
                 (int(book_id),),
             )
             db.execute("DELETE FROM books WHERE id = ?", (int(book_id),))
+
+    def book_index_updated_at(self, book_id: int) -> str | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT index_updated_at FROM books WHERE id = ?",
+                (int(book_id),),
+            ).fetchone()
+        if not row:
+            return None
+        return row["index_updated_at"]
+
+    def touch_book_index_sync(self, book_id: int) -> None:
+        with self._connect() as db:
+            db.execute(
+                """
+                UPDATE books
+                SET index_updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (int(book_id),),
+            )
 
     def save_book_index(self, book: Book) -> int:
         """Salva metadados + índice sem baixar o texto dos capítulos.

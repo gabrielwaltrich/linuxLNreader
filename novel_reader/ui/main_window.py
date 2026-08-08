@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from novel_reader.app_config import AppConfigStore
 from novel_reader.browser import BrowserSession
 from novel_reader.database import LibraryDatabase
 from novel_reader.models import Book, Chapter, UrlKind
@@ -44,6 +45,8 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.settings = QSettings("NovelReader", "NovelReader")
+        self.app_config_store = AppConfigStore()
+        self.app_config = self.app_config_store.load()
         self.dark_mode = self.settings.value("dark_mode", False, bool)
         self.source_manager = SourceManager()
         self.library_db = LibraryDatabase()
@@ -135,6 +138,11 @@ class MainWindow(QMainWindow):
         self.favorite_button.clicked.connect(self.toggle_current_favorite)
         self.favorite_button.setEnabled(False)
 
+        self.current_library_button = QPushButton("＋ Library")
+        self.current_library_button.setToolTip("Adicionar/remover o livro atual da Library")
+        self.current_library_button.clicked.connect(self.toggle_current_library)
+        self.current_library_button.setEnabled(False)
+
         self.fullscreen_button = QPushButton("Tela cheia")
         self.fullscreen_button.clicked.connect(self.toggle_fullscreen)
 
@@ -150,6 +158,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(self.increase_button)
         controls.addWidget(self.theme_button)
         controls.addWidget(self.favorite_button)
+        controls.addWidget(self.current_library_button)
         controls.addStretch(1)
         controls.addWidget(self.progress_label)
         controls.addStretch(1)
@@ -441,6 +450,7 @@ class MainWindow(QMainWindow):
             self.library_panel.set_current_url(chapter.url)
             self._refresh_continue_button()
             self._refresh_favorite_button()
+            self._refresh_current_library_button()
         else:
             self.library_panel.set_current_url("")
 
@@ -449,6 +459,8 @@ class MainWindow(QMainWindow):
 
         if not persist or not chapter.url:
             self.favorite_button.setEnabled(False)
+            self.current_library_button.setEnabled(False)
+            self.current_library_button.setText("＋ Library")
 
     def open_previous(self) -> None:
         if self._current_previous_url:
@@ -475,6 +487,27 @@ class MainWindow(QMainWindow):
         self.url_input.setText(url)
         self.open_url()
 
+    def toggle_current_library(self) -> None:
+        if not self.current_chapter or not self.current_chapter.url:
+            return
+        book = self.library_db.book_for_url(self.current_chapter.url)
+        if not book:
+            return
+        self.library_db.toggle_book_library(book.id)
+        self.library_panel.refresh()
+        self._refresh_current_library_button()
+        self._refresh_favorite_button()
+
+    def _refresh_current_library_button(self) -> None:
+        if not self.current_chapter or not self.current_chapter.url:
+            self.current_library_button.setEnabled(False)
+            self.current_library_button.setText("＋ Library")
+            return
+        book = self.library_db.book_for_url(self.current_chapter.url)
+        self.current_library_button.setEnabled(book is not None)
+        in_library = bool(book and self.library_db.is_book_in_library(book.id))
+        self.current_library_button.setText("✓ Library" if in_library else "＋ Library")
+
     def toggle_current_favorite(self) -> None:
         if not self.current_chapter or not self.current_chapter.url:
             return
@@ -484,6 +517,7 @@ class MainWindow(QMainWindow):
         self.library_db.toggle_book_favorite(book.id)
         self.library_panel.refresh()
         self._refresh_favorite_button()
+        self._refresh_current_library_button()
 
     def _refresh_favorite_button(self) -> None:
         if not self.current_chapter or not self.current_chapter.url:
@@ -531,3 +565,20 @@ class MainWindow(QMainWindow):
         self.settings.setValue("line_height", self.reader.line_height)
         self.settings.setValue("dark_mode", self.dark_mode)
         super().closeEvent(event)
+
+
+def _sync_app_config_from_reader(self) -> None:
+    """Persist GUI reading preferences to the shared config file."""
+    try:
+        changes = {}
+        if hasattr(self, "reader"):
+            if hasattr(self.reader, "font_size"):
+                changes["font_size"] = int(self.reader.font_size)
+            if hasattr(self.reader, "content_width"):
+                changes["content_width"] = int(self.reader.content_width)
+            if hasattr(self.reader, "line_height"):
+                changes["line_height"] = float(self.reader.line_height)
+        if changes:
+            self.app_config = self.app_config_store.update(**changes)
+    except Exception:
+        pass

@@ -8,6 +8,10 @@ from novel_reader.database import LibraryDatabase
 from novel_reader.services.chapter_cache import ChapterCache
 from novel_reader.terminal_config import COVER_MODES, TerminalConfigStore, TerminalUiConfig
 from novel_reader.terminal_cover import CoverRender, TerminalCoverRenderer
+from novel_reader.error_handling import classify_exception, log_exception
+from novel_reader.app_config import AppConfigStore
+from novel_reader.services.cache_manager import CacheManager, CacheStats
+from novel_reader.services.sync_policy import decide_refresh, relative_sync_text
 from novel_reader.terminal_reader import (
     TerminalReaderSettings,
     page_index_from_progress,
@@ -210,6 +214,10 @@ class NovelReaderTui:
         self.state = TuiState()
         self.config_store = TerminalConfigStore()
         self.ui_config = self.config_store.load()
+        self.app_config_store = AppConfigStore()
+        self.app_config = self.app_config_store.load()
+        self.cache_manager = CacheManager(self.cache.cache_root)
+        self._offline_filter = False
         self.cover_renderer = TerminalCoverRenderer()
         self.cover: CoverRender = CoverRender(mode="off", label="sem capa")
         self._kitty_drawn = False
@@ -233,6 +241,15 @@ class NovelReaderTui:
 
     def _entries(self):
         entries = self.database.known_index(self.book_id)
+
+        if self._offline_filter:
+            cached_urls = self.cache.cached_urls()
+            entries = [
+                item
+                for item in entries
+                if item.url in cached_urls
+            ]
+
         query = self.state.query.strip().casefold()
         if not query:
             return entries
@@ -287,6 +304,23 @@ class NovelReaderTui:
                 added = self.database.toggle_book_library(self.book_id)
                 self.state.message = "Adicionado à Library." if added else "Removido da Library."
                 continue
+            if key in (ord("F"), ord("f")):
+                value = self.database.toggle_book_favorite(self.book_id)
+                self.state.message = "Favoritado ★." if value else "Removido dos favoritos."
+                continue
+            if key in (ord("O"), ord("o")):
+                self._offline_filter = not self._offline_filter
+                self.state.selected = 0
+                self.state.offset = 0
+                self.state.message = (
+                    "Filtro Offline ativado."
+                    if self._offline_filter
+                    else "Filtro Offline desativado."
+                )
+                continue
+            if key in (ord("X"), ord("x")):
+                self._cache_manager_popup(stdscr)
+                continue
             if key in (ord("A"), ord("a")):
                 self._prefetch_next(stdscr, entries)
                 continue
@@ -327,7 +361,10 @@ class NovelReaderTui:
                     self._open_reader(stdscr, url)
                 continue
             if key in (ord("r"), ord("R")):
-                self._refresh_index(stdscr)
+                self._refresh_index(stdscr, force=False)
+                continue
+            if key == curses.KEY_F5:
+                self._refresh_index(stdscr, force=True)
                 continue
             if key in (10, 13, curses.KEY_ENTER):
                 if entries:
@@ -428,8 +465,12 @@ class NovelReaderTui:
                 x += 2
 
     def _draw_index(self, stdscr, entries) -> None:
+        # Sync metadata is displayed in the header/status area below.
         stdscr.erase()
         L = self._layout(stdscr)
+        last_sync_label = relative_sync_text(
+            self.database.book_index_updated_at(self.book_id)
+        )
         h, w = L["h"], L["w"]
 
         # Header
@@ -456,7 +497,10 @@ class NovelReaderTui:
         )
 
         total, read, done, current = self._book_stats()
-        stats = f"{total} capítulos  •  {read} lidos  •  {done} concluídos  •  {current} em andamento"
+        stats = (
+            f"{total} capítulos  •  {read} lidos  •  {done} concluídos  •  "
+            f"{current} em andamento  •  Última sync: {last_sync_label}"
+        )
         _safe_add(stdscr, 2, 2, stats)
 
         if self.state.query:
@@ -491,9 +535,10 @@ class NovelReaderTui:
             number = f"{item.position:>4}" if item.position is not None else "   -"
 
             prefix = "▶" if selected else " "
-            title_space = max(10, L["list_w"] - 21)
+            cache_mark = "◆" if self.cache.has(item.url) else " "
+            title_space = max(10, L["list_w"] - 23)
             title = item.title[:title_space]
-            line = f"{prefix} {number}  {title:<{title_space}} {status:>7}"
+            line = f"{prefix} {cache_mark} {number}  {title:<{title_space}} {status:>7}"
 
             if selected:
                 attr = curses.A_BOLD | curses.A_REVERSE
@@ -522,10 +567,14 @@ class NovelReaderTui:
                 ("I", "Capa"),
                 ("?", "Kitty"),
                 ("L", "Library"),
+                ("F", "Favorito"),
                 ("A", "Offline"),
+                ("O", "Filtro offline"),
+                ("X", "Cache"),
                 ("C", "Continuar"),
                 ("U", "Próximo"),
                 ("R", "Atualizar"),
+                ("F5", "Forçar sync"),
                 ("Q", "Sair"),
             ],
         )
@@ -794,6 +843,9 @@ class NovelReaderTui:
     def _prefetch_next(self, stdscr, entries) -> None:
         if not entries:
             return
+        if self.app_config.offline_mode:
+            self.state.message = "Modo offline ativo: pré-cache pela rede desativado."
+            return
         count = max(0, min(int(self.ui_config.prefetch_count), 20))
         if count <= 0:
             self.state.message = "Prefetch está desativado."
@@ -818,12 +870,116 @@ class NovelReaderTui:
             try:
                 chapter = self.runtime.load_chapter(item.url)
                 self.cache.save(chapter)
+                self.cache_manager.enforce_limit(self.app_config.cache_limit_mb)
                 saved += 1
             except Exception:
                 # Stop at first inaccessible/network failure; never attempt
                 # bypasses or alternate endpoints.
                 break
         self.state.message = f"{saved}/{len(candidates)} próximo(s) capítulo(s) em cache."
+
+    def _cache_manager_popup(self, stdscr) -> None:
+        options = [
+            "Atualizar estatísticas",
+            "Limpar capítulos",
+            "Limpar capas",
+            "Limpar tudo",
+            "Alternar modo offline",
+            "Voltar",
+        ]
+        selected = 0
+        message = ""
+
+        while True:
+            stats = self.cache_manager.stats()
+            h, w = stdscr.getmaxyx()
+            popup_w = min(72, max(48, w - 10))
+            popup_h = min(18, max(14, h - 6))
+            win = curses.newwin(
+                popup_h,
+                popup_w,
+                max(0, (h-popup_h)//2),
+                max(0, (w-popup_w)//2),
+            )
+            win.keypad(True)
+            win.erase()
+            win.box()
+            _safe_add(win, 0, 2, " GERENCIADOR DE CACHE ", curses.A_BOLD | _color(1))
+
+            _safe_add(
+                win, 2, 3,
+                f"Total: {CacheStats.human_size(stats.total_bytes)} / "
+                f"{self.app_config.cache_limit_mb} MB",
+                curses.A_BOLD,
+            )
+            _safe_add(
+                win, 3, 3,
+                f"Capítulos: {CacheStats.human_size(stats.chapters_bytes)}",
+            )
+            _safe_add(
+                win, 4, 3,
+                f"Capas: {CacheStats.human_size(stats.covers_bytes)}",
+            )
+            _safe_add(
+                win, 5, 3,
+                f"Arquivos: {stats.files}",
+            )
+            _safe_add(
+                win, 6, 3,
+                f"Modo offline: {'ATIVO' if self.app_config.offline_mode else 'desativado'}",
+                _color(3) if self.app_config.offline_mode else curses.A_DIM,
+            )
+
+            row = 8
+            for index, label in enumerate(options):
+                attr = curses.A_REVERSE | curses.A_BOLD if index == selected else 0
+                _safe_add(
+                    win,
+                    row + index,
+                    3,
+                    f"{'▶' if index == selected else ' '} {label}",
+                    attr,
+                )
+
+            if message:
+                _safe_add(win, popup_h - 2, 3, message[:popup_w-6], curses.A_DIM)
+            win.refresh()
+
+            key = win.getch()
+            if key in (27, ord("q"), ord("Q")):
+                return
+            if key in (curses.KEY_UP, ord("k"), ord("K")):
+                selected = (selected - 1) % len(options)
+                continue
+            if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                selected = (selected + 1) % len(options)
+                continue
+            if key not in (10, 13, curses.KEY_ENTER):
+                continue
+
+            action = options[selected]
+            if action == "Voltar":
+                return
+            if action == "Atualizar estatísticas":
+                message = "Estatísticas atualizadas."
+            elif action == "Limpar capítulos":
+                count = self.cache_manager.clear_chapters()
+                message = f"{count} arquivo(s) de capítulo removido(s)."
+            elif action == "Limpar capas":
+                count = self.cache_manager.clear_covers()
+                message = f"{count} arquivo(s) de capa removido(s)."
+            elif action == "Limpar tudo":
+                count = self.cache_manager.clear_all()
+                message = f"{count} arquivo(s) removido(s)."
+            elif action == "Alternar modo offline":
+                self.app_config = self.app_config_store.update(
+                    offline_mode=not self.app_config.offline_mode
+                )
+                message = (
+                    "Modo offline ativado."
+                    if self.app_config.offline_mode
+                    else "Modo offline desativado."
+                )
 
     def _search_popup(self, stdscr) -> None:
         h, w = stdscr.getmaxyx()
@@ -883,30 +1039,90 @@ class NovelReaderTui:
 
         curses.curs_set(0)
 
-    def _refresh_index(self, stdscr) -> None:
-        self.state.message = "Atualizando índice…"
+    def _refresh_index(self, stdscr, force: bool = False) -> None:
+        last_sync = self.database.book_index_updated_at(self.book_id)
+        decision = decide_refresh(
+            last_sync=last_sync,
+            ttl_minutes=self.app_config.index_refresh_minutes,
+            force=force,
+            offline=self.app_config.offline_mode,
+        )
+
+        if decision.reason == "offline":
+            self.state.message = "Modo offline: atualização do índice desativada."
+            return
+
+        if not decision.should_refresh:
+            self.state.message = (
+                f"Índice ainda recente ({relative_sync_text(last_sync)}). "
+                "Use F5 para forçar."
+            )
+            return
+
+        self.state.message = (
+            "Forçando atualização do índice…"
+            if force
+            else "Atualizando índice…"
+        )
         self._draw_index(stdscr, self._entries())
 
+        def status_callback(message: str) -> None:
+            if not message:
+                return
+            self.state.message = message
+            self._draw_index(stdscr, self._entries())
+
         try:
-            self.book = self.runtime.load_book(self.book.url)
+            try:
+                self.book = self.runtime.load_book(
+                    self.book.url,
+                    status_callback=status_callback,
+                )
+            except TypeError:
+                self.book = self.runtime.load_book(self.book.url)
+
             self.book_id = self.database.save_book_index(self.book)
+            self.database.touch_book_index_sync(self.book_id)
             self._prepare_cover()
             self.state.message = (
-                f"Índice atualizado: "
+                f"Índice atualizado agora: "
                 f"{len(self.database.known_index(self.book_id))} capítulos."
             )
         except Exception as exc:
-            self.state.message = f"Falha: {exc}"
+            error = log_exception(exc, context="terminal_tui.refresh_index")
+            self.state.message = f"{error.title} — log: {error.log_file}"
 
     def _load_chapter(self, url: str):
+        cached = self.cache.load(url)
+
+        if self.app_config.offline_mode:
+            if cached is not None:
+                self.state.message = "Modo offline: usando cache local."
+                return cached
+            raise RuntimeError(
+                "Modo offline: este capítulo não está em cache."
+            )
+
         try:
-            chapter = self.runtime.load_chapter(url)
+            try:
+                chapter = self.runtime.load_chapter(
+                    url,
+                    status_callback=lambda message: setattr(
+                        self.state,
+                        "message",
+                        message or "Capítulo: carregando…",
+                    ),
+                )
+            except TypeError:
+                chapter = self.runtime.load_chapter(url)
             self.cache.save(chapter)
+            self.cache_manager.enforce_limit(
+                self.app_config.cache_limit_mb
+            )
             return chapter
         except Exception:
-            cached = self.cache.load(url)
             if cached is not None:
-                self.state.message = "Usando cache local."
+                self.state.message = "Rede indisponível; usando cache local."
                 return cached
             raise
 
@@ -918,7 +1134,8 @@ class NovelReaderTui:
         try:
             chapter = self._load_chapter(url)
         except Exception as exc:
-            self.state.message = f"Não foi possível abrir: {exc}"
+            error = log_exception(exc, context="terminal_tui.open_reader")
+            self.state.message = f"{error.title} — veja {error.log_file}"
             return
 
         old_progress = self.database.progress_for(url)

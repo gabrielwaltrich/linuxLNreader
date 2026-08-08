@@ -289,8 +289,11 @@ class BrowserSession(QObject):
         self._ranking_last_count = len(items)
         self._ranking_last_signature = signature
 
+        total_captures = len(self.RANKING_CAPTURE_DELAYS_MS)
+        current_capture = min(self._capture_index + 1, total_captures)
         self.status_changed.emit(
-            f"Ranking: {len(items)} obras acumuladas; percorrendo a lista…"
+            f"Ranking: {len(items)} obras encontradas · "
+            f"captura {current_capture}/{total_captures}"
         )
 
         self._capture_index += 1

@@ -41,5 +41,24 @@ class ChapterCache:
         except Exception:
             return None
 
+
+    @property
+    def cache_root(self) -> Path:
+        return self.cache_dir.parent
+
+    def cached_urls(self) -> set[str]:
+        urls: set[str] = set()
+        if not self.cache_dir.exists():
+            return urls
+        for path in self.cache_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                url = str(data.get("url") or "").strip()
+                if url:
+                    urls.add(url)
+            except Exception:
+                continue
+        return urls
+
     def has(self, url: str) -> bool:
         return bool(url and self.path_for(url).exists())

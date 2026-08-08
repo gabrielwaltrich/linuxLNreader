@@ -1,3 +1,5 @@
+from novel_reader.app_config import AppConfigStore
+
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QDoubleSpinBox,
     QSpinBox, QVBoxLayout

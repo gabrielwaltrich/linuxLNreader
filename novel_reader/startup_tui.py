@@ -14,6 +14,11 @@ from novel_reader.services.webnovel_ranking import (
 from novel_reader.terminal_reader import TerminalReaderSettings
 from novel_reader.terminal_config import TerminalConfigStore
 from novel_reader.terminal_cover import CoverRender, TerminalCoverRenderer
+from novel_reader.services.chapter_cache import ChapterCache
+from novel_reader.error_handling import classify_exception, log_exception
+from novel_reader.app_config import AppConfigStore
+from novel_reader.services.cache_manager import CacheManager, CacheStats
+from novel_reader.services.search_service import SearchHistory, SearchResult, fuzzy_match, fuzzy_score
 from novel_reader.terminal_tui import run_book_tui_inplace
 
 
@@ -90,11 +95,16 @@ class StartupTui:
 
         self.config_store = TerminalConfigStore()
         self.ui_config = self.config_store.load()
+        self.app_config_store = AppConfigStore()
+        self.app_config = self.app_config_store.load()
         self.cover_renderer = TerminalCoverRenderer()
+        self._chapter_cache = ChapterCache()
+        self.cache_manager = CacheManager(self._chapter_cache.cache_root)
         self._ranking_cover_cache: dict[str, CoverRender] = {}
         self._ranking_native_drawn = False
         self._ranking_native_key = ""
         self._ranking_cache: dict[str, list] = {}
+        self.search_history = SearchHistory()
 
     def run(self) -> int:
         while True:
@@ -167,6 +177,9 @@ class StartupTui:
         if action == "search":
             self._unified_search()
             return None
+        if action == "cache":
+            self._cache_manager_home()
+            return None
         if action == "continue":
             last = self.database.last_opened()
             if not last:
@@ -184,13 +197,17 @@ class StartupTui:
         # This avoids terminal mode corruption and raw ESC sequences such as
         # ^[[B becoming visible after returning from a book.
         self._clear_ranking_native()
-        run_book_tui_inplace(
-            self.stdscr,
-            runtime=self.runtime,
-            book_url=url,
-            database=self.database,
-            reader_settings=self.reader_settings,
-        )
+        try:
+            run_book_tui_inplace(
+                self.stdscr,
+                runtime=self.runtime,
+                book_url=url,
+                database=self.database,
+                reader_settings=self.reader_settings,
+            )
+        except Exception as exc:
+            error = log_exception(exc, context="startup_tui.open_book")
+            self._friendly_error_popup(error)
         try:
             curses.flushinp()
         except curses.error:
@@ -217,8 +234,26 @@ class StartupTui:
                     if period in self._ranking_cache:
                         books = self._ranking_cache[period]
                         message = f"{len(books)} obras em cache."
+                    elif self.app_config.offline_mode:
+                        books = []
+                        message = "Modo offline: ranking não armazenado nesta sessão."
                     else:
-                        books = self.runtime.load_ranking(ranking_url(period))
+                        def ranking_status(text: str):
+                            nonlocal message
+                            if text:
+                                message = text
+                                self._draw_ranking_loading(
+                                    period_label=RANKING_PERIODS[period_index][1],
+                                    message=message,
+                                )
+
+                        try:
+                            books = self.runtime.load_ranking(
+                                ranking_url(period),
+                                status_callback=ranking_status,
+                            )
+                        except TypeError:
+                            books = self.runtime.load_ranking(ranking_url(period))
                         self._ranking_cache[period] = books
                         message = f"{len(books)} obras encontradas."
                     loaded_period = period
@@ -241,12 +276,12 @@ class StartupTui:
                 self._clear_ranking_native()
                 self._kitty_diagnostics_popup()
                 continue
-            if key in (curses.KEY_LEFT, ord("h"), ord("H")):
+            if key == curses.KEY_LEFT:
                 self._clear_ranking_native()
                 period_index = (period_index - 1) % len(RANKING_PERIODS)
                 loaded_period = None
                 continue
-            if key in (curses.KEY_RIGHT, ord("l"), ord("L")):
+            if key == curses.KEY_RIGHT:
                 self._clear_ranking_native()
                 period_index = (period_index + 1) % len(RANKING_PERIODS)
                 loaded_period = None
@@ -281,6 +316,19 @@ class StartupTui:
                 added = self.database.toggle_book_library(book_id)
                 message = "Adicionado à Library (Planejo ler)." if added else "Removido da Library."
                 continue
+            if key in (ord("F"), ord("f")) and books:
+                item = books[selected]
+                book_id = self.database.ensure_catalog_book(
+                    source="WebNovel",
+                    title=item.title,
+                    url=item.url,
+                    author=item.author,
+                    cover_url=item.cover_url,
+                    synopsis=item.synopsis,
+                )
+                value = self.database.toggle_book_favorite(book_id)
+                message = "Favoritado ★ no Ranking." if value else "Removido dos favoritos."
+                continue
             if key in (ord("/"), ord("s"), ord("S")):
                 query = self._prompt_text(
                     "SEARCH",
@@ -288,18 +336,48 @@ class StartupTui:
                     "",
                 )
                 if query:
-                    q = query.casefold()
-                    matches = [
-                        (i, item) for i, item in enumerate(books)
-                        if q in item.title.casefold()
-                        or q in item.author.casefold()
-                        or q == str(item.rank)
+                    self.search_history.add(query)
+                    scored = [
+                        (
+                            100 if query.strip() == str(item.rank) else fuzzy_score(
+                                query,
+                                item.title,
+                                item.author,
+                            ),
+                            i,
+                        )
+                        for i, item in enumerate(books)
                     ]
-                    if matches:
-                        selected = matches[0][0]
+                    scored = [pair for pair in scored if pair[0] >= 58]
+                    scored.sort(reverse=True)
+                    if scored:
+                        selected = scored[0][1]
+                        message = f"Melhor resultado: {scored[0][0]}%."
                     else:
-                        message = "Nenhum resultado."
+                        message = "Nenhum resultado aproximado."
                 continue
+
+    def _draw_ranking_loading(self, *, period_label: str, message: str) -> None:
+        self._clear_ranking_native()
+        self.stdscr.erase()
+        h, w = self.stdscr.getmaxyx()
+        _add(self.stdscr, 0, 2, " NOVEL READER ", curses.A_BOLD | _color(4))
+        _add(
+            self.stdscr,
+            2,
+            2,
+            f"Fan-Fic Power Ranking · {period_label}",
+            curses.A_BOLD | _color(1),
+        )
+        _add(self.stdscr, 4, 4, message or "Carregando…", curses.A_BOLD)
+        _add(
+            self.stdscr,
+            6,
+            4,
+            "O ranking é carregado progressivamente para capturar cards virtualizados.",
+            curses.A_DIM,
+        )
+        self.stdscr.refresh()
 
     def _draw_ranking(self, books, period_index, selected, offset, message):
         self.stdscr.erase()
@@ -414,7 +492,7 @@ class StartupTui:
             self.stdscr,
             h - 3,
             2,
-            "←→ período  ↑↓ selecionar  Enter abrir  L Library  / buscar  ? kitty  Esc voltar",
+            "←→ período  ↑↓ selecionar  Enter abrir  L Library  F favorito  / buscar  ? kitty  Esc voltar",
             curses.A_DIM,
         )
         _add(self.stdscr, h - 2, 2, message, curses.A_BOLD | _color(3))
@@ -577,13 +655,28 @@ class StartupTui:
                 sort=sort_modes[sort_index],
             )
             if query:
-                q = query.casefold()
                 books = [
                     book for book in books
-                    if q in book.display_title.casefold()
-                    or q in (book.author or "").casefold()
-                    or q in (book.tags or "").casefold()
+                    if fuzzy_match(
+                        query,
+                        book.display_title,
+                        book.author or "",
+                        book.tags or "",
+                        self._category_label(
+                            self.database.effective_book_category(book)
+                        ),
+                        threshold=55,
+                    )
                 ]
+                books.sort(
+                    key=lambda book: fuzzy_score(
+                        query,
+                        book.display_title,
+                        book.author or "",
+                        book.tags or "",
+                    ),
+                    reverse=True,
+                )
 
             category_mode = category_modes[category_index]
             if category_mode == "favorites":
@@ -693,7 +786,9 @@ class StartupTui:
                 sort_index = (sort_index + 1) % len(sort_modes)
                 selected = offset = 0
             elif key in (ord("/"), ord("s"), ord("S")):
-                query = self._prompt_text("SEARCH LIBRARY", "Título/autor:", query)
+                query = self._prompt_text("SEARCH LIBRARY", "Título, autor, tag ou categoria:", query)
+                if query:
+                    self.search_history.add(query)
                 selected = offset = 0
             elif key == ord("x"):
                 query = ""
@@ -974,85 +1069,297 @@ class StartupTui:
             elif key in (10, 13, curses.KEY_ENTER):
                 return index
 
+    def _cache_manager_home(self):
+        options = [
+            "Atualizar estatísticas",
+            "Limpar capítulos",
+            "Limpar capas",
+            "Limpar tudo",
+            "Alternar modo offline",
+            "Voltar",
+        ]
+        selected = 0
+        message = ""
+
+        while True:
+            stats = self.cache_manager.stats()
+            h, w = self.stdscr.getmaxyx()
+            popup_w = min(74, max(50, w - 10))
+            popup_h = min(18, max(14, h - 6))
+            win = curses.newwin(
+                popup_h,
+                popup_w,
+                max(0, (h-popup_h)//2),
+                max(0, (w-popup_w)//2),
+            )
+            win.keypad(True)
+            win.erase()
+            win.box()
+            _add(win, 0, 2, " OFFLINE E CACHE ", curses.A_BOLD | _color(1))
+            _add(
+                win, 2, 3,
+                f"Uso: {CacheStats.human_size(stats.total_bytes)} / "
+                f"{self.app_config.cache_limit_mb} MB",
+                curses.A_BOLD,
+            )
+            _add(win, 3, 3, f"Capítulos: {CacheStats.human_size(stats.chapters_bytes)}")
+            _add(win, 4, 3, f"Capas: {CacheStats.human_size(stats.covers_bytes)}")
+            _add(
+                win, 5, 3,
+                f"Modo offline: {'ATIVO' if self.app_config.offline_mode else 'desativado'}",
+                _color(3) if self.app_config.offline_mode else curses.A_DIM,
+            )
+
+            row = 7
+            for index, label in enumerate(options):
+                attr = curses.A_REVERSE | curses.A_BOLD if index == selected else 0
+                _add(win, row+index, 3, f"{'▶' if index == selected else ' '} {label}", attr)
+
+            if message:
+                _add(win, popup_h-2, 3, message[:popup_w-6], curses.A_DIM)
+            win.refresh()
+
+            key = win.getch()
+            if key in (27, ord("q"), ord("Q")):
+                return
+            if key in (curses.KEY_UP, ord("k"), ord("K")):
+                selected = (selected - 1) % len(options)
+                continue
+            if key in (curses.KEY_DOWN, ord("j"), ord("J")):
+                selected = (selected + 1) % len(options)
+                continue
+            if key not in (10, 13, curses.KEY_ENTER):
+                continue
+
+            action = options[selected]
+            if action == "Voltar":
+                return
+            if action == "Atualizar estatísticas":
+                message = "Estatísticas atualizadas."
+            elif action == "Limpar capítulos":
+                message = f"{self.cache_manager.clear_chapters()} arquivo(s) removido(s)."
+            elif action == "Limpar capas":
+                message = f"{self.cache_manager.clear_covers()} arquivo(s) removido(s)."
+            elif action == "Limpar tudo":
+                message = f"{self.cache_manager.clear_all()} arquivo(s) removido(s)."
+            elif action == "Alternar modo offline":
+                self.app_config = self.app_config_store.update(
+                    offline_mode=not self.app_config.offline_mode
+                )
+                message = (
+                    "Modo offline ativado."
+                    if self.app_config.offline_mode
+                    else "Modo offline desativado."
+                )
+
     def _unified_search(self):
         query = self._prompt_text(
             "BUSCA UNIFICADA",
-            "Título, autor, tag ou URL:",
+            "Título, autor, tag, categoria, URL ou H para histórico:",
             "",
         )
         if not query:
             return
 
+        if query.casefold() == "h":
+            history = self.search_history.load()
+            if not history:
+                self.state.message = "Histórico de buscas vazio."
+                return
+            chosen = self._choice_popup("HISTÓRICO DE BUSCAS", history, 0)
+            if chosen is None:
+                return
+            query = history[chosen]
+
+        self._run_unified_search(query)
+
+    def _run_unified_search(self, query: str):
+        query = str(query).strip()
+        if not query:
+            return
+
+        self.search_history.add(query)
+
         if query.startswith("http://") or query.startswith("https://"):
             self._open_book(query)
             return
 
-        # Library results are local and immediate. Ranking data is reused when
-        # already visited; the first online ranking search is cached for the
-        # rest of this CLI session.
         self._draw_loading("Buscando na Library…")
-        q = query.casefold()
-        results = []
+        results: list[SearchResult] = []
 
         for book in self.database.user_library_books(limit=10000):
-            if (
-                q in book.display_title.casefold()
-                or q in (book.author or "").casefold()
-                or q in (book.tags or "").casefold()
-            ):
-                results.append(("Library", book.display_title, book.author, book.book_url))
+            category = self._category_label(
+                self.database.effective_book_category(book)
+            )
+            score = fuzzy_score(
+                query,
+                book.display_title,
+                book.author or "",
+                book.tags or "",
+                category,
+            )
+            if score >= 55:
+                results.append(
+                    SearchResult(
+                        source="Library",
+                        title=book.display_title,
+                        author=book.author or "",
+                        url=book.book_url or "",
+                        score=score,
+                        detail=f"{category} · {book.tags or 'sem tags'}",
+                        book_id=book.id,
+                        favorite=bool(book.favorite),
+                        in_library=True,
+                    )
+                )
 
-        ranking = self._ranking_cache.get("monthly")
-        if ranking is None:
+        monthly_cached = self._ranking_cache.get("monthly")
+        ranking_sets = list(self._ranking_cache.items())
+        if not ranking_sets and not self.app_config.offline_mode:
             self._draw_loading("Completando busca com o ranking mensal…")
             try:
-                ranking = self.runtime.load_ranking(ranking_url("monthly"))
+                try:
+                    monthly = self.runtime.load_ranking(
+                        ranking_url("monthly"),
+                        status_callback=lambda text: self._draw_loading(
+                            text or "Buscando no ranking mensal…"
+                        ),
+                    )
+                except TypeError:
+                    monthly = self.runtime.load_ranking(ranking_url("monthly"))
+                ranking = monthly
                 self._ranking_cache["monthly"] = ranking
+                ranking_sets = [("monthly", ranking)]
             except Exception:
-                ranking = []
+                ranking_sets = []
 
-        for item in ranking:
-            if q in item.title.casefold() or q in item.author.casefold():
-                results.append(("Ranking", item.title, item.author, item.url))
+        period_labels = {key: label for key, label, _ in RANKING_PERIODS}
+        for period, ranking in ranking_sets:
+            for item in ranking:
+                score = fuzzy_score(query, item.title, item.author)
+                if score < 55:
+                    continue
+                book = self.database.book_for_url(item.url)
+                results.append(
+                    SearchResult(
+                        source=f"Ranking/{period_labels.get(period, period)}",
+                        title=item.title,
+                        author=item.author,
+                        url=item.url,
+                        score=score,
+                        detail=f"Rank #{item.rank}",
+                        book_id=book.id if book else None,
+                        favorite=bool(book.favorite) if book else False,
+                        in_library=(
+                            self.database.is_book_in_library(book.id)
+                            if book else False
+                        ),
+                    )
+                )
 
-        # Dedupe by URL.
-        deduped = []
-        seen = set()
+        by_url: dict[str, SearchResult] = {}
         for result in results:
-            if not result[3] or result[3] in seen:
+            if not result.url:
                 continue
-            seen.add(result[3])
-            deduped.append(result)
+            current = by_url.get(result.url)
+            if current is None or result.source == "Library" or result.score > current.score:
+                by_url[result.url] = result
+
+        deduped = sorted(
+            by_url.values(),
+            key=lambda item: (
+                item.source != "Library",
+                -item.score,
+                item.title.casefold(),
+            ),
+        )
 
         if not deduped:
-            self.state.message = "Nenhum resultado na Library/ranking mensal."
+            self.state.message = "Nenhum resultado aproximado encontrado."
             return
 
         index = 0
+        message = ""
         while True:
             self.stdscr.erase()
             h, w = self.stdscr.getmaxyx()
             _add(self.stdscr, 0, 2, " NOVEL READER ", curses.A_BOLD | _color(4))
-            _add(self.stdscr, 0, 17, f"Busca: {query}", curses.A_BOLD | _color(1))
-            visible = max(3, h - 5)
-            start = max(0, min(index - visible + 1, max(0, len(deduped)-visible)))
-            for row, item in enumerate(deduped[start:start+visible], start=2):
+            _add(
+                self.stdscr,
+                0,
+                17,
+                f"Busca: {query} · {len(deduped)} resultado(s)",
+                curses.A_BOLD | _color(1),
+            )
+            visible = max(3, h - 6)
+            start = max(0, min(index - visible + 1, max(0, len(deduped) - visible)))
+            for row, item in enumerate(deduped[start:start + visible], start=2):
                 absolute = start + row - 2
-                source, title, author, _ = item
                 attr = curses.A_REVERSE | curses.A_BOLD if absolute == index else 0
-                _add(self.stdscr, row, 2, f"{'▶' if absolute == index else ' '} [{source}] {title} — {author}", attr)
-            _add(self.stdscr, h-2, 2, "↑↓ mover  Enter abrir  Esc voltar", curses.A_DIM)
+                flags = ("★" if item.favorite else " ") + ("L" if item.in_library else " ")
+                line = (
+                    f"{'▶' if absolute == index else ' '} {flags} "
+                    f"[{item.source}] {item.title} — {item.author} ({item.score}%)"
+                )
+                _add(self.stdscr, row, 2, line[: max(1, w - 4)], attr)
+
+            if message:
+                _add(self.stdscr, h - 3, 2, message[: max(1, w - 4)], _color(3))
+
+            _add(
+                self.stdscr,
+                h - 2,
+                2,
+                "↑↓ mover  Enter abrir  L Library  F favorito  H histórico  Esc voltar",
+                curses.A_DIM,
+            )
             self.stdscr.refresh()
+
             key = self.stdscr.getch()
             if key == 27:
                 return
             if key in (curses.KEY_UP, ord("k"), ord("K")):
-                index = max(0, index-1)
+                index = max(0, index - 1)
             elif key in (curses.KEY_DOWN, ord("j"), ord("J")):
-                index = min(len(deduped)-1, index+1)
+                index = min(len(deduped) - 1, index + 1)
             elif key in (10, 13, curses.KEY_ENTER):
-                self._open_book(deduped[index][3])
+                self._open_book(deduped[index].url)
                 return
+            elif key in (ord("L"), ord("l")):
+                item = deduped[index]
+                book_id = item.book_id
+                if book_id is None:
+                    book_id = self.database.ensure_catalog_book(
+                        source="WebNovel",
+                        title=item.title,
+                        url=item.url,
+                        author=item.author,
+                    )
+                    item.book_id = book_id
+                item.in_library = self.database.toggle_book_library(book_id)
+                message = "Adicionado à Library." if item.in_library else "Removido da Library."
+            elif key in (ord("F"), ord("f")):
+                item = deduped[index]
+                book_id = item.book_id
+                if book_id is None:
+                    book_id = self.database.ensure_catalog_book(
+                        source="WebNovel",
+                        title=item.title,
+                        url=item.url,
+                        author=item.author,
+                    )
+                    item.book_id = book_id
+                item.favorite = self.database.toggle_book_favorite(book_id)
+                item.in_library = self.database.is_book_in_library(book_id)
+                message = "Favoritado ★." if item.favorite else "Removido dos favoritos."
+            elif key in (ord("H"), ord("h")):
+                history = self.search_history.load()
+                if history:
+                    chosen = self._choice_popup("HISTÓRICO DE BUSCAS", history, 0)
+                    if chosen is not None:
+                        return self._run_unified_search(history[chosen])
+                else:
+                    message = "Histórico vazio."
 
     def _confirm(self, title: str, message: str, detail: str = "") -> bool:
         h, w = self.stdscr.getmaxyx()

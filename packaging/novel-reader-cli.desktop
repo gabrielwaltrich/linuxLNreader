@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Novel Reader CLI
+GenericName=Novel Reader Terminal
+Comment=Abra o Novel Reader no terminal
+Exec=novel-reader-cli
+Icon=novel-reader
+Terminal=true
+Categories=Utility;Education;
+Keywords=novel;webnovel;reader;terminal;

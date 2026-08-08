@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Novel Reader
+GenericName=Novel/Webnovel Reader
+Comment=Leia novels e webnovels no Linux
+Exec=novel-reader
+Icon=novel-reader
+Terminal=false
+Categories=Utility;Education;
+Keywords=novel;webnovel;reader;reading;
+StartupNotify=true

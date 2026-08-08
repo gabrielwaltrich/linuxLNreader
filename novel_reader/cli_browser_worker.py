@@ -49,6 +49,26 @@ class BrowserWorker(QObject):
         )
         self.notifier.activated.connect(self._read_command)
 
+    def _emit_status(self, message: str) -> None:
+        try:
+            request_id = None
+            if isinstance(getattr(self, "pending", None), dict):
+                request_id = self.pending.get("id")
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "id": request_id,
+                        "type": "status",
+                        "message": str(message),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            sys.stdout.flush()
+        except Exception:
+            pass
+
     def _send(self, payload: dict) -> None:
         sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
         sys.stdout.flush()
